@@ -1,0 +1,6 @@
+path: /home/fastcampus/Downloads/test/로봇강의_예제/02_Doosan_Robot_제어/yolo_dataset
+train: images/train
+val: images/val
+
+nc: 1
+names: ['wood cube']
