@@ -1,3 +1,4 @@
+# YOLO 학습 설정 (auto_label.py 가 생성)
 path: /home/fastcampus/Downloads/test/로봇강의_예제/02_Doosan_Robot_제어/yolo_dataset
 train: images/train
 val: images/val

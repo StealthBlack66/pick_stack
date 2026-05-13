@@ -1,6 +1,6 @@
 task: segment
 mode: train
-model: yolov8n-seg.pt
+model: yolov8s-seg.pt
 data: /home/fastcampus/Downloads/test/로봇강의_예제/02_Doosan_Robot_제어/yolo_dataset_seg/data.yaml
 epochs: 80
 time: null

@@ -1,20 +1,13 @@
 """
-SAM2 점 prompt + 정사각형 강제 → cube **상단면**만 정확히 segment 하는 라벨링.
+SAM2 점 prompt + 정사각형 강제 → cube 상단면만 seg polygon 라벨.
 
-기존 bbox_to_seg_label.py 의 문제: SAM2 bbox prompt 는 cube 전체(top+측면)를
-mask 로 줘서 학습 polygon aspect ratio 가 평균 2:1 로 길쭉. 모델이 그대로
-학습 → 추론 mask 도 cube 전체.
+흐름:
+  1) yolo_dataset/labels/{train,val}/*.txt 의 detect bbox 라벨을 읽음
+  2) 각 bbox center 픽셀을 SAM2 점 prompt 로 호출 → mask
+  3) minAreaRect 의 짧은 변 = cube top side, 정사각형 polygon 강제 생성
+  4) yolo_dataset_seg/{images,labels}/{train,val}/ 에 저장 + data.yaml
 
-이 스크립트:
-  1) 기존 detect bbox 라벨의 cube 중심 픽셀 (cx*W, cy*H) 를 점 prompt 로 SAM2 호출
-  2) 반환 mask 의 minAreaRect → 짧은 변 = cube top side
-  3) **정사각형 강제**: side x side 사각형, center=점 prompt 좌표, angle 유지
-  4) 정사각형 polygon → 정규화 → seg 라벨 작성
-
-기존 라벨은 yolo_dataset_seg/labels_v2_bbox_backup/ 로 자동 백업.
-
-사용:
-  python3 point_to_seg_label.py
+이미지는 hardlink (디스크 안 늘어남).
 """
 import os
 import shutil
@@ -26,18 +19,14 @@ import numpy as np
 from ultralytics import SAM
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
-SRC_DIR = SCRIPT_DIR                     # yolo_dataset/
+SRC_DIR = SCRIPT_DIR
 DST_DIR = SCRIPT_DIR.parent / 'yolo_dataset_seg'
 
 SAM_WEIGHTS = '/home/fastcampus/Downloads/test/sam2.1_b.pt'
 CLASSES = ['wood cube']
 
-# 정사각형 검증 임계: mask aspect ratio 가 이보다 크면 SAM2 가 cube 외 영역까지
-# 잡았다고 보고 그 instance 는 라벨에서 제외 (학습 손상 방지).
+# mask aspect ratio 가 이보다 크면 SAM2 가 cube 외 영역까지 잡았다고 보고 reject
 ASPECT_REJECT = 2.5
-
-# polygon 4꼭짓점만 사용 (정사각형 강제했으므로 더 많은 점 불필요).
-# YOLOv8-seg 학습에는 polygon 최소 3점 이상이면 OK.
 
 
 def read_bbox_labels(label_path: Path):
@@ -57,9 +46,7 @@ def read_bbox_labels(label_path: Path):
 
 
 def mask_to_square_polygon(mask, point_uv, W, H):
-    """SAM2 mask → minAreaRect 짧은 변으로 정사각형 polygon (normalized 4점).
-    실패 시 None.
-    """
+    """SAM2 mask → 짧은 변 기준 정사각형 polygon (normalized 4점). 실패 시 None."""
     m = (mask > 0).astype(np.uint8) * 255
     kernel = np.ones((3, 3), np.uint8)
     m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kernel)
@@ -73,13 +60,9 @@ def mask_to_square_polygon(mask, point_uv, W, H):
     (_rcx, _rcy), (rw, rh), angle = rect
     if min(rw, rh) <= 1:
         return None
-    aspect = max(rw, rh) / min(rw, rh)
-    if aspect > ASPECT_REJECT:
-        return None  # cube 외 영역까지 잡힘 — 라벨 손상 방지로 reject
+    if max(rw, rh) / min(rw, rh) > ASPECT_REJECT:
+        return None
 
-    # 정사각형 강제: 짧은 변 길이 = cube top side. center 는 점 prompt 좌표
-    # (사용자가 cube top 중앙으로 본 점) 사용 — minAreaRect center 가
-    # 측면 영향으로 cube 중심에서 벗어나도 점 prompt 가 더 신뢰적.
     side = float(min(rw, rh))
     u, v = float(point_uv[0]), float(point_uv[1])
     box = cv2.boxPoints(((u, v), (side, side), float(angle)))
@@ -102,26 +85,6 @@ def hardlink_or_copy(src: Path, dst: Path):
         shutil.copy2(src, dst)
 
 
-def backup_existing_labels():
-    """기존 seg 라벨이 있으면 labels_v2_bbox_backup/ 으로 이동."""
-    seg_lbl = DST_DIR / 'labels'
-    if not seg_lbl.exists():
-        return
-    backup = DST_DIR / 'labels_v2_bbox_backup'
-    if backup.exists():
-        print(f'  기존 백업 발견 → 그대로 유지: {backup}')
-        # 새 라벨 디렉토리 비우기
-        for split in ('train', 'val'):
-            d = seg_lbl / split
-            if d.exists():
-                for f in d.iterdir():
-                    if f.is_file():
-                        f.unlink()
-        return
-    print(f'  기존 seg 라벨 → {backup} 로 백업')
-    shutil.move(str(seg_lbl), str(backup))
-
-
 def process_split(sam, split: str):
     src_img = SRC_DIR / 'images' / split
     src_lbl = SRC_DIR / 'labels' / split
@@ -129,6 +92,10 @@ def process_split(sam, split: str):
     dst_lbl = DST_DIR / 'labels' / split
     dst_img.mkdir(parents=True, exist_ok=True)
     dst_lbl.mkdir(parents=True, exist_ok=True)
+    # 기존 라벨 비우기
+    for f in dst_lbl.iterdir():
+        if f.is_file():
+            f.unlink()
 
     imgs = sorted([p for p in src_img.iterdir()
                    if p.suffix.lower() in {'.jpg', '.jpeg', '.png', '.bmp'}])
@@ -178,15 +145,14 @@ def process_split(sam, split: str):
 
 
 def write_data_yaml():
-    content = f"""# YOLO seg 학습 설정 (point_to_seg_label.py 가 생성)
+    (DST_DIR / 'data.yaml').write_text(f"""# YOLO seg 학습 설정 (point_to_seg_label.py 가 생성)
 path: {DST_DIR}
 train: images/train
 val: images/val
 
 nc: {len(CLASSES)}
 names: {CLASSES}
-"""
-    (DST_DIR / 'data.yaml').write_text(content, encoding='utf-8')
+""", encoding='utf-8')
     print(f'  data.yaml: {DST_DIR / "data.yaml"}')
 
 
@@ -197,8 +163,6 @@ def main():
     print(f'=== Point prompt + 정사각형 강제 → seg 라벨 ===')
     print(f'  src: {SRC_DIR}')
     print(f'  dst: {DST_DIR}')
-
-    backup_existing_labels()
 
     print(f'  SAM2 로드...')
     sam = SAM(SAM_WEIGHTS)
@@ -215,8 +179,8 @@ def main():
     write_data_yaml()
     print(f'\n=== 완료 ===')
     print(f'  이미지 OK: {total_ok}장, skip: {total_skip}장')
-    print(f'  polygon: {total_poly}개 (reject by aspect>2.5: {total_reject}개)')
-    print(f'  다음: python3 train_seg.py  (NAME=seg_v3 으로 미리 변경)')
+    print(f'  polygon: {total_poly}개 (reject by aspect>{ASPECT_REJECT}: {total_reject}개)')
+    print(f'  다음: python3 train_seg.py')
 
 
 if __name__ == '__main__':
