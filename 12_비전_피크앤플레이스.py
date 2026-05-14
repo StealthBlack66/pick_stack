@@ -696,6 +696,77 @@ class PickAndPlace(Node):
         """관절 각도(도) 6개로 직접 이동."""
         self._send_trajectory_to_joints(joints_deg, duration)
 
+    def _send_trajectory_multi(self, waypoints_joints_deg, segment_durations, smooth_steps=10):
+        """여러 waypoint 를 한 trajectory action 으로.
+        smooth_steps >= 2 면 각 segment 를 cubic smoothstep (3t²-2t³) 곡선으로
+        sub-waypoint 분포 → segment 안에서 가속 → 정속 → 감속 (ease-in-out).
+        첫 segment 는 시작점 (현재 robot 위치) 미지라 그대로 둠 (controller 보간).
+
+        waypoints_joints_deg: [[6 joint deg], ...]
+        segment_durations: 각 waypoint 까지 segment 시간."""
+        if not self.traj_action.wait_for_server(timeout_sec=5.0):
+            raise RuntimeError('FollowJointTrajectory 액션 서버 미응답')
+
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory.joint_names = JOINT_NAMES
+
+        t = 0.0
+        for i, (w, dt) in enumerate(zip(waypoints_joints_deg, segment_durations)):
+            if i == 0 or smooth_steps < 2:
+                # 첫 segment 또는 smooth 안 함 → waypoint 1개만
+                t += float(dt)
+                pt = JointTrajectoryPoint()
+                pt.positions = [math.radians(float(a)) for a in w]
+                pt.time_from_start = Duration(
+                    sec=int(t), nanosec=int((t - int(t)) * 1e9))
+                goal.trajectory.points.append(pt)
+            else:
+                # prev_w → w 를 smooth_steps 개 sub-waypoint 로 cubic smoothstep 분포
+                prev_w = waypoints_joints_deg[i - 1]
+                sub_dt = float(dt) / smooth_steps
+                for k in range(1, smooth_steps + 1):
+                    progress = k / smooth_steps
+                    s = progress * progress * (3.0 - 2.0 * progress)  # ease-in-out
+                    sub = [prev_w[j] + (w[j] - prev_w[j]) * s for j in range(len(w))]
+                    t += sub_dt
+                    pt = JointTrajectoryPoint()
+                    pt.positions = [math.radians(float(a)) for a in sub]
+                    pt.time_from_start = Duration(
+                        sec=int(t), nanosec=int((t - int(t)) * 1e9))
+                    goal.trajectory.points.append(pt)
+
+        send_fut = self.traj_action.send_goal_async(goal)
+        rclpy.spin_until_future_complete(self, send_fut, timeout_sec=10.0)
+        gh = send_fut.result()
+        if gh is None or not gh.accepted:
+            raise RuntimeError('Multi-WP Trajectory 골이 거부됨')
+
+        result_fut = gh.get_result_async()
+        rclpy.spin_until_future_complete(self, result_fut, timeout_sec=t + 30.0)
+        status = result_fut.result().status
+        if status != 4:
+            raise RuntimeError(f'Multi-WP Trajectory 실패 (status={status})')
+
+    def move_line_base_multi(self, waypoints_xyz_rpy, segment_durations):
+        """여러 base waypoint (xyz_mm, rpy_deg) 를 한 trajectory 로 — 매끄럽고 빠름.
+        waypoints_xyz_rpy: [((x,y,z_mm), (r,p,y_deg)), ...]
+        segment_durations: 각 waypoint 까지 시간."""
+        joints_list = []
+        for xyz_mm, rpy_deg in waypoints_xyz_rpy:
+            x, y, z_user = xyz_mm
+            z = z_user + self.tcp_z_offset
+            if not (WORK_X[0] <= x <= WORK_X[1] and
+                    WORK_Y[0] <= y <= WORK_Y[1] and
+                    WORK_Z[0] <= z_user <= WORK_Z[1]):
+                raise RuntimeError(
+                    f'좌표 {[round(v,1) for v in (x,y,z_user)]} mm (그리퍼 끝 기준) 가 작업영역 밖. '
+                    f'X∈{WORK_X}, Y∈{WORK_Y}, Z∈{WORK_Z}.')
+            self._wait(self.cli_ikin, 'motion/ikin')
+            joints_list.append(self._ikin_with_fallback(
+                [float(x), float(y), float(z),
+                 float(rpy_deg[0]), float(rpy_deg[1]), float(rpy_deg[2])]))
+        self._send_trajectory_multi(joints_list, segment_durations)
+
     def move_line_base(self, xyz_mm, rpy_deg=None, duration=MOVE_DURATION_SEC):
         """베이스 좌표 (mm/deg) → Ikin 으로 IK 풀고 trajectory 액션으로 이동.
         rpy_deg 미지정 시 self.top_down_rpy (cal_top_down 으로 갱신 가능) 사용.

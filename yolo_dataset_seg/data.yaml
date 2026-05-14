@@ -1,4 +1,4 @@
-# YOLO seg 학습 설정 (point_to_seg_label.py 가 생성)
+# YOLO seg 학습 설정 (build_seg_dataset.py 가 생성)
 path: /home/fastcampus/Downloads/test/로봇강의_예제/02_Doosan_Robot_제어/yolo_dataset_seg
 train: images/train
 val: images/val
