@@ -1,171 +1,294 @@
-# 두산 e0509 Hand-Eye Calibration (Eye-to-Hand)
+# Doosan E0509 × RH-P12-RN-A — 비전 기반 큐브 정렬 & 탑 쌓기
 
-원샷 자동 캘리브레이션 스크립트 — RealSense 카메라 + Doosan e0509 + ArUco 마커
+> **Intel RealSense + YOLO 세그멘테이션 + 두산 E0509 로봇 + RH-P12-RN-A 그리퍼**로  
+> 바닥에 흩어진 나무 큐브를 자동으로 바둑판 배열로 정렬하고, 수직 탑·피라미드를 쌓는 프로젝트입니다.
+
+![Python](https://img.shields.io/badge/Python-3.10-blue?logo=python)
+![ROS2](https://img.shields.io/badge/ROS2-Humble-orange?logo=ros)
+![YOLO](https://img.shields.io/badge/YOLOv8-Segmentation-purple?logo=ultralytics)
+![License](https://img.shields.io/badge/License-MIT-green)
+
+---
+
+## 데모
+
+| 바둑판 정렬 (15) | 탑 쌓기 (16) |
+|:---:|:---:|
+| *(영상/GIF 추가 예정)* | *(영상/GIF 추가 예정)* |
+
+---
+
+## 주요 기능
+
+### 15 — 바둑판 정렬 (`15_바둑판_정렬.py`)
+- **YOLO 세그멘테이션**으로 실시간 나무 큐브 검출 (RealSense RGB-D)
+- **5×5 그리드 (50 mm 간격)** 자동 배치 — 충돌·핑거 공간 자동 회피
+- 폴리곤 면적·종횡비 필터로 false positive 억제
+- 트래킹 EMA 스무딩으로 떨림 없는 안정적 pick
+- `--dry-run` 모드: 실제 모션 없이 전체 시퀀스 콘솔 검증
+- `--limit N` 옵션으로 지정 개수만 정렬
+
+### 16 — 탑 쌓기 (`16_탑쌓기.py`)
+- 정렬된 큐브를 기반으로 **두 가지 탑 구성**
+  - **Tower 1** — 수직 1자 5층 스택
+  - **Tower 2** — 피라미드 3-2-1 (바닥 3개 → 중간 2개 → 꼭대기 1개)
+- pick yaw + 90° 그립으로 X/Y 양축 friction 정렬 강화
+- 탑 높이 이상의 safe-z 경유로 충돌 없는 이동
+- `--dry-run` 모드 동일 지원
+
+---
+
+## 하드웨어 구성
+
+| 항목 | 사양 |
+|---|---|
+| 로봇 암 | Doosan E0509 (6-DOF) |
+| 그리퍼 | RH-P12-RN-A (Robotis) |
+| 카메라 | Intel RealSense D455 / D435 |
+| 마커 | ArUco DICT_6X6_50, ID=0, 50 mm (Hand-Eye 캘리브레이션용) |
+
+---
+
+## 소프트웨어 요구사항
+
+| 항목 | 버전 |
+|---|---|
+| Ubuntu | 22.04 |
+| ROS 2 | Humble (iron / jazzy도 가능) |
+| Python | 3.10 |
+| doosan_ws | `dsr_msgs2`, `dsr_bringup2`, `dsr_moveit_config_e0509` 포함 빌드 |
+
+```bash
+pip install numpy opencv-contrib-python scipy pyrealsense2 ultralytics torch
+# (선택) .env 파일 사용 시
+pip install python-dotenv
+```
+
+> ⚠️ 반드시 **`opencv-contrib-python`** — 일반 `opencv-python`에는 ArUco 모듈 없음
+
+---
 
 ## 빠른 시작
 
+### 1. 저장소 클론
+
+```bash
+git clone https://github.com/StealthBlack66/pick_stack.git
+cd pick_stack
+```
+
+### 2. 환경 설정 (30초 셋업)
+
+모든 스크립트는 `doosan_config.py` 한 곳에서 환경을 읽습니다.  
+**IP, namespace, ROS distro 등을 `.env` 파일 하나로 통합 관리**할 수 있습니다.
+
+```bash
+# 템플릿 복사
+cp .env.example .env
+
+# 자기 환경 값으로 수정 (IP, namespace 등)
+nano .env
+
+# 적용 확인
+python3 doosan_config.py
+```
+
+`NAMESPACE`, `ROBOT_IP` 등이 설정한 값으로 출력되면 완료. 이후 모든 스크립트에 자동 반영됩니다.
+
+#### `.env` 설정 항목
+
+| 환경변수 | 기본값 | 설명 |
+|---|---|---|
+| `DSR_NAME` | `dsr01` | ROS namespace |
+| `DSR_MODEL` | `e0509` | 로봇 모델 |
+| `DSR_HOST` | `110.120.1.XX` | 컨트롤러 IP (미지정 시 서브넷 자동 스캔) |
+| `DSR_RT_HOST` | `110.120.1.XX` | PC 측 RT 호스트 IP |
+| `DSR_SUBNET` | `110.120.1` | IP 자동 탐색 서브넷 (`.1~.100` 스캔) |
+| `DSR_BRINGUP_PKG` | `dsr_bringup2` | bringup 패키지 이름 (fork 다른 경우) |
+| `DSR_BRINGUP_LAUNCH` | `dsr_bringup2_moveit.launch.py` | launch 파일 이름 |
+| `DSR_MOVEIT_CONTROLLER` | `dsr_moveit_controller` | MoveIt 컨트롤러 이름 |
+| `DOOSAN_WS` | `~/doosan_ws` | 워크스페이스 경로 |
+| `ROS_DISTRO` | `humble` | ROS distro |
+
+**우선순위:** 셸 `export` > `.env` 파일 > `doosan_config.py` 기본값
+
+`.env` 없이 셸 export만으로도 동일하게 동작합니다:
+
+```bash
+export DSR_NAME=dsr01e0509
+export DSR_HOST=192.168.137.100
+python3 15_바둑판_정렬.py
+```
+
+> 본인 환경의 namespace를 모른다면:
+> ```bash
+> ros2 node list | head
+> ros2 service list | grep set_robot_mode
+> ```
+
+### 3. Hand-Eye 캘리브레이션 (최초 1회)
+
 ```bash
 ./run_calibration.sh
+# → calibration_data/calibration_result.npz 생성
 ```
 
-이게 전부예요. 나머지는 자동:
-- ROS distro 자동 감지 (humble/iron/jazzy 등)
-- doosan_ws 위치 자동 감지 (`~/doosan_ws`, `~/ros2_ws`, `~/dsr_ws`, `/opt/doosan_ws`)
-- Python venv 자동 감지 (또는 시스템 python)
-- **로봇 IP 자동 탐색** (`110.120.1.1` ~ `110.120.1.100` 범위 port 12345 스캔)
-- 첫 실행 후 IP 캐시 → 다음부터 즉시 연결
-
-## 요구사항
-
-### 환경
-- Linux (Ubuntu 22.04 권장)
-- ROS 2 (humble 등)
-- doosan_ws 빌드됨 (`dsr_msgs2`, `dsr_bringup2`, `dsr_moveit_config_e0509` 포함)
-- Python 패키지:
-  ```bash
-  pip install numpy opencv-contrib-python scipy pyrealsense2
-  ```
-  (반드시 **opencv-contrib-python** — 일반 opencv-python 에는 ArUco 없음)
-
-### 하드웨어
-- **두산 e0509** 로봇 + 컨트롤러 (port 12345)
-- **Intel RealSense** 카메라 (D455, D435 등)
-- **ArUco 마커** DICT_6X6_50, ID=1, 50mm × 50mm
-  - 직접 그린 마커 ❌ (정확도 낮음)
-  - `generate_aruco_marker.py` 로 생성 후 깨끗하게 인쇄 ✅
-  - 평판(아크릴/PVC) 에 단단히 부착, 그리퍼에 견고하게 고정
-
-### 네트워크
-- 로봇 컨트롤러 IP: `110.120.1.X` (X = 1~100)
-- RT control IP: 기본 `110.120.1.5` (다르면 `--rt-host` 로 지정)
-
-## 사용 방법
-
-### 1. 마커 인쇄 (한 번만)
+### 4. 바둑판 정렬 실행
 
 ```bash
-python3 generate_aruco_marker.py
-# → aruco_DICT_6X6_50_ID0_50mm.png 생성
-# → 100% 스케일로 인쇄, 자로 50mm 확인
-# → 평판에 부착, 그리퍼에 고정
+# Dry-run (모션 없이 시퀀스 검증)
+python3 15_바둑판_정렬.py --dry-run
+
+# 실 동작
+python3 15_바둑판_정렬.py
+
+# 처음 N개만 정렬
+python3 15_바둑판_정렬.py --limit 10
 ```
 
-다른 ID/사이즈 원하면:
+### 5. 탑 쌓기 실행
+
 ```bash
-python3 generate_aruco_marker.py --id 1 --size 50
+# Dry-run
+python3 16_탑쌓기.py --dry-run
+
+# 실 동작
+python3 16_탑쌓기.py
 ```
 
-### 2. 캘리브레이션 실행
+---
 
-```bash
-./run_calibration.sh
+## 파이프라인 개요
+
+```
+[RealSense RGB-D]
+       │  RGB 프레임
+       ▼
+[YOLOv8 Segmentation]  →  큐브 mask polygon
+       │  bbox center + depth
+       ▼
+[Hand-Eye 역변환]  →  base frame XY 좌표 (mm)
+       │
+       ├─ 15: 그리드 셀 할당 → 충돌 검사 → pick & place
+       │
+       └─ 16: Tower1 (5층 수직) + Tower2 (피라미드 3-2-1)
+                   │
+                   ▼
+            [Doosan E0509 + RH-P12-RN-A]
 ```
 
-### 3. 진행 (cv2 창에서 키 입력)
+---
 
-| 키 | 동작 |
+## 🔧 주요 CLI 옵션
+
+### `15_바둑판_정렬.py`
+
+| 옵션 | 설명 |
 |---|---|
-| `s` | 현재 자세를 base 로 저장 (시작점) |
-| Enter | 16 포즈 자동 순회 시작 (~3분) |
-| `c` | 캘리브레이션 계산 + 자동 정제 (목표 도달까지 추가 라운드) |
-| `h` | base 자세로 복귀 |
-| `d` | 디버그: ArUco 사전 자동 탐색 |
-| `q` | 종료 |
+| `--dry-run` | 모션/그리퍼 명령 없이 콘솔 출력만 |
+| `--limit N` | 처음 N개 큐브만 정렬 |
+| `--conf 0.4` | YOLO 검출 신뢰도 임계값 |
+| `--host IP` | 로봇 IP 직접 지정 |
 
-### 4. 결과 파일
+### `16_탑쌓기.py`
 
-```
-calibration_data/
-├── calibration_result.npz   # 최종 X (camera → base) + 오차 metric
-├── calibration_data.npz     # 수집한 모든 pose 데이터 (재계산 가능)
-└── images/                  # 각 pose 의 카메라 이미지 (디버그)
-```
-
-`calibration_result.npz` 내용:
-- `T_cam2base`: 4×4 카메라→베이스 변환 행렬
-- `R_cam2base`, `t_cam2base`: 회전/이동 분리
-- `pos_err_mean_mm`, `rot_err_mean_deg`: 오차 metric
-- `camera_matrix`, `dist_coeffs`: 카메라 intrinsics
-
-## CLI 옵션
-
-```bash
-./run_calibration.sh --help
-```
-
-| 옵션 | 의미 |
+| 옵션 | 설명 |
 |---|---|
-| `--host 110.120.1.X` | 로봇 IP 직접 지정 (자동탐색 우회) |
-| `--rt-host 110.120.1.5` | RT control 호스트 |
-| `--no-cleanup` | 기존 ROS 프로세스 정리 생략 |
-| `--keep-bringup` | 종료 시 launch 살려두기 (RViz 계속 사용) |
-| `--no-moveit` | MoveIt 빼고 RViz-only (디버그용) |
+| `--dry-run` | 모션/그리퍼 명령 없이 콘솔 출력만 |
+| `--conf 0.4` | YOLO 검출 신뢰도 임계값 |
+| `--host IP` | 로봇 IP 직접 지정 |
 
-## 환경변수 (CLI 대신)
+---
 
-```bash
-DSR_HOST=110.120.1.18 ./run_calibration.sh
-DSR_RT_HOST=110.120.1.5 ./run_calibration.sh
-DSR_NAME=dsr01 ./run_calibration.sh
-DSR_MODEL=e0509 ./run_calibration.sh
-DOOSAN_WS=/path/to/doosan_ws ./run_calibration.sh
-ROS_DISTRO=humble ./run_calibration.sh
+## 로봇 상태 & 충돌 복구
+
+두산 컨트롤러는 이전 세션의 충돌·protective stop 신호가 남아있으면 모든 명령이 무시됩니다.  
+`activate_robot()` 루틴이 **매 실행 시작 시 자동으로 복구**합니다.
+
+### 로봇 상태 코드
+
+| 코드 | 상태 | 처리 방법 |
+|---|---|---|
+| 1 | STANDBY | 정상 — 명령 가능 |
+| 2 | MOVING | 정상 — 이동 중 |
+| 3 / 10 | SAFE_OFF / SAFE_OFF2 | `SetRobotControl(1)` 로 Servo 재활성 |
+| **5 / 9** | **SAFE_STOP / SAFE_STOP2** | **자동 복구 대상** (아래 시퀀스) |
+| **6** | **EMERGENCY_STOP** | **코드로 해제 불가 — 펜던트 비상정지 버튼 수동 해제 필요** |
+
+### 자동 복구 시퀀스 (SAFE_STOP / SAFE_STOP2)
+
+```
+1) set_safety_mode(safety_mode=2)         ← RECOVERY 진입
+2) set_safe_stop_reset_type(reset_type=0) ← safe-stop 리셋
+3) set_safety_mode(safety_mode=1)         ← AUTONOMOUS 복귀
 ```
 
-## 정확도 가이드
+각 단계 사이 0.5초 대기 (컨트롤러 내부 상태 전이가 비동기이므로 필요).  
+최종 상태가 `STANDBY(1)` 또는 `MOVING(2)` 이면 복구 성공.
 
-| 등급 | 위치 평균 | 회전 평균 | 의미 |
-|---|---|---|---|
-| 🟢 매우 우수 | < 3mm | < 0.5° | 산업 등급 정밀 작업 |
-| 🟢 우수 | < 8mm | < 1.5° | 일반 정밀 픽앤플레이스 |
-| 🟡 양호 | < 15mm | < 3° | 일반 작업용 |
-| 🟡 보통 | < 30mm | < 5° | 재시도 권장 |
-| 🔴 부정확 | ≥ 30mm | ≥ 5° | 셋업 점검 필수 |
+> 복구 확인 방법: 로봇을 손으로 막아 충돌 발생 → 스크립트 재실행 →  
+> 콘솔에 `robot_state=5 (SAFE_STOP) → recovery 시퀀스 실행 → robot_state=1 (STANDBY)` 확인
 
-자동 정제는 **🟢 매우 우수 등급 도달까지** 추가 포즈 수집을 반복합니다 (최대 5라운드, 라운드당 8 포즈).
+자세한 코드 구현은 [`RECOVERY.md`](RECOVERY.md) 참고.
+
+---
 
 ## 트러블슈팅
 
 | 증상 | 원인 / 해결 |
 |---|---|
-| `Doosan 컨트롤러 응답 없음` | 로봇 전원/네트워크 확인. `--host` 로 IP 직접 지정. |
-| `RealSense Device or resource busy` | 다른 프로세스가 카메라 잡고있음. `pkill -9 -f realsense` |
-| `doosan_ws 자동 감지 실패` | 환경변수 `DOOSAN_WS=/path/to/ws` 로 지정 |
-| 마커 검출 안 됨 | `d` 키 눌러 ArUco 사전 자동 탐색 |
-| 축이 떨림/튐 | 마커 인쇄 품질 / 평면성 / 마운팅 강도 점검 |
-| `success=True` 인데 robot 안 움직임 | 두산 박스 stuck. 비상정지 한번 → 풀기, 또는 컨트롤러 power cycle |
+| `FileNotFoundError: best.pt` | `yolo_dataset/runs/seg_v6/weights/best.pt` 경로 확인 |
+| `Doosan 컨트롤러 응답 없음` | 로봇 전원/네트워크 확인, `--host` 또는 `DSR_HOST` 로 IP 직접 지정 |
+| `doosan_ws 자동 감지 실패` | `DOOSAN_WS=/path/to/ws` 환경변수 지정 |
+| `RealSense Device busy` | `pkill -9 -f realsense` 후 재실행 |
+| 큐브 검출 안 됨 | `--conf` 낮추거나 조명 개선 |
+| 그리퍼가 큐브를 놓침 | 캘리브레이션 재실행 (`./run_calibration.sh`) |
+| `success=True` 인데 로봇 미동작 | 로봇 상태 코드 확인 → `RECOVERY.md` 참고 |
+| "서비스 미응답" / "namespace 못 찾음" | `python3 doosan_config.py` 로 현재 설정 확인 후 `.env` 의 `DSR_NAME` 수정 |
+| `dsr_msgs` import 오류 | 이 프로젝트는 `dsr_msgs2` 기준. 다른 fork 사용 시 import 직접 수정 필요 |
 
-## 알고리즘 (요약)
+---
+
+## 파일 구조
 
 ```
-[1] cv2.calibrateHandEye 5 method 비교 → 가장 낮은 잔차 method 선택
-        ↓
-[2] Nonlinear refinement (Levenberg-Marquardt) → AX=XB 잔차 직접 minimize
-        ↓
-[3] Iterative outlier rejection (2σ 기준) → flyer 제외 후 재 refinement
-        ↓
-[4] Auto-refine 루프 → 매우 우수 등급 도달까지 추가 포즈 수집 반복
+.
+├── 15_바둑판_정렬.py              # 메인: 큐브 검출 → 그리드 배치
+├── 16_탑쌓기.py                   # 메인: 정렬된 큐브 → 탑 구성
+│
+├── 12_비전_피크앤플레이스.py       # PickAndPlace / RobotController (공통 모듈)
+├── 13_비전_피크앤플레이스_curobo.py
+├── 14_비전_액체_세그멘테이션.py
+│
+├── 08_카메라_핸드아이_캘리브레이션.py
+├── 09_원샷_캘리브레이션.py         # 자동 Hand-Eye 캘리브레이션
+├── run_calibration.sh              # 캘리브레이션 원클릭 실행
+│
+├── doosan_config.py                # 환경 설정 허브 (IP, namespace, ROS distro 등)
+├── .env.example                    # 환경변수 템플릿 → .env 로 복사해서 사용
+├── generate_aruco_marker.py        # ArUco 마커 생성
+│
+├── PORTABILITY.md                  # 다른 환경에서 실행하기 (상세 가이드)
+├── RECOVERY.md                     # 충돌 복구 코드 & 상태 코드 레퍼런스
+│
+├── yolo_dataset/                   # YOLO 학습 데이터 & 가중치
+│   └── runs/seg_v6/weights/best.pt
+├── calibration_data/               # Hand-Eye 캘리브레이션 결과
+│   └── calibration_result.npz
 ```
 
-## 캘리브레이션 결과 사용 예시
+---
 
-```python
-import numpy as np
+## 관련 프로젝트 / 참고
 
-# Calibration 결과 로드
-result = np.load("calibration_data/calibration_result.npz")
-T_cam2base = result['T_cam2base']  # 4×4
+- [doosan-robotics/doosan-robot2](https://github.com/doosan-robotics/doosan-robot2) — ROS 2 드라이버
+- [e0509_gripper_description](https://github.com/fhekwn549/e0509_gripper_description) — E0509 + RH-P12-RN-A 결합 URDF 패키지
+- [Ultralytics YOLOv8](https://github.com/ultralytics/ultralytics) — 세그멘테이션 모델
+- [Intel RealSense SDK](https://github.com/IntelRealSense/librealsense) — 뎁스 카메라
+- [Robotis RH-P12-RN-A](https://emanual.robotis.com/docs/en/platform/rh_p12_rna/) — 그리퍼
 
-# 이미지에서 검출한 객체 위치 → 로봇 베이스 좌표
-def object_in_camera_to_base(t_obj_cam: np.ndarray) -> np.ndarray:
-    """t_obj_cam: 카메라 frame 에서 본 객체 위치 (m)"""
-    t_obj_cam_h = np.append(t_obj_cam, 1.0)   # homogeneous
-    t_obj_base_h = T_cam2base @ t_obj_cam_h
-    return t_obj_base_h[:3]                    # base frame (m)
-```
+---
 
-## 라이선스 / 출처
+## 라이선스
 
-- Doosan e0509 driver: [doosan-robotics/doosan-robot2](https://github.com/doosan-robotics/doosan-robot2)
-- Hand-Eye math: OpenCV `cv2.calibrateHandEye` (TSAI/PARK/HORAUD/ANDREFF/DANIILIDIS)
-- Refinement: scipy.optimize.least_squares (LM)
+MIT License — 자유롭게 사용·수정·배포 가능합니다.
