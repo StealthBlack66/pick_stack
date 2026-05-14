@@ -41,8 +41,7 @@ _spec.loader.exec_module(p12)
 
 
 # ===== 설정 =====
-YOLO_WEIGHTS = ('/home/fastcampus/Downloads/test/로봇강의_예제/'
-                '02_Doosan_Robot_제어/yolo_dataset/runs/seg_v6/weights/best.pt')
+YOLO_WEIGHTS = str(Path(__file__).parent / 'yolo_dataset/runs/seg_v6/weights/best.pt')
 DETECT_CONF_THR = 0.40
 NMS_IOU_THR = 0.45
 RS_W, RS_H, RS_FPS = 1280, 720, 30
