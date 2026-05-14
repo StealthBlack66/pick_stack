@@ -591,9 +591,11 @@ class CubeDetector:
             cv2.imwrite(save_debug, dbg)
         return out
 
-    def preview_until_confirm(self, save_debug=None):
+    def preview_until_confirm(self, save_debug=None, custom_msg=None, valid_keys=None):
         """라이브 화면 + 검출 → 사용자 확인 후 그 시점 검출 반환.
         키:  ENTER/SPACE = 확정,  q/ESC = 취소,  s = 스크린샷
+        custom_msg: 화면에 표시할 텍스트 리스트
+        valid_keys: 지정된 키가 눌리면 (dets, key) 반환
         """
         win = 'YOLO preview (ENTER=confirm, s=shot, q=quit)'
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
@@ -678,21 +680,39 @@ class CubeDetector:
                                 (x1, min(color.shape[0] - 5, y2 + 14)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 200, 255), 1)
 
-                cv2.putText(vis,
-                            f'detected={len(dets)}  ENTER=confirm  s=shot  q=quit',
-                            (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                if custom_msg:
+                    cv2.putText(vis, f'detected={len(dets)}', (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    y_offset = 55
+                    for line in custom_msg:
+                        cv2.putText(vis, line, (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                        y_offset += 25
+                else:
+                    cv2.putText(vis,
+                                f'detected={len(dets)}  ENTER=confirm  s=shot  q=quit',
+                                (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                 cv2.imshow(win, vis)
                 k = cv2.waitKey(20) & 0xFF
                 if k in (ord('q'), 27):
                     cv2.destroyWindow(win)
                     cv2.waitKey(1)
-                    return None
-                if k in (13, 10, ord(' ')):
-                    if save_debug:
-                        cv2.imwrite(save_debug, vis)
-                    cv2.destroyWindow(win)
-                    cv2.waitKey(1)
-                    return dets
+                    return (None, None) if valid_keys else None
+                
+                if valid_keys:
+                    char_k = chr(k) if 0 <= k < 256 else ''
+                    if char_k in valid_keys:
+                        if save_debug:
+                            cv2.imwrite(save_debug, vis)
+                        cv2.destroyWindow(win)
+                        cv2.waitKey(1)
+                        return dets, char_k
+                else:
+                    if k in (13, 10, ord(' ')):
+                        if save_debug:
+                            cv2.imwrite(save_debug, vis)
+                        cv2.destroyWindow(win)
+                        cv2.waitKey(1)
+                        return dets
+                        
                 if k == ord('s'):
                     out = save_debug or '/tmp/cubes_preview.png'
                     cv2.imwrite(out, vis)
