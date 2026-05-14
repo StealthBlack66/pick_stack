@@ -101,8 +101,8 @@ python3 doosan_config.py
 |---|---|---|
 | `DSR_NAME` | `dsr01` | ROS namespace |
 | `DSR_MODEL` | `e0509` | 로봇 모델 |
-| `DSR_HOST` | `110.120.1.18` | 컨트롤러 IP (미지정 시 서브넷 자동 스캔) |
-| `DSR_RT_HOST` | `110.120.1.5` | PC 측 RT 호스트 IP |
+| `DSR_HOST` | `110.120.1.XX` | 컨트롤러 IP (미지정 시 서브넷 자동 스캔) |
+| `DSR_RT_HOST` | `110.120.1.XX` | PC 측 RT 호스트 IP |
 | `DSR_SUBNET` | `110.120.1` | IP 자동 탐색 서브넷 (`.1~.100` 스캔) |
 | `DSR_BRINGUP_PKG` | `dsr_bringup2` | bringup 패키지 이름 (fork 다른 경우) |
 | `DSR_BRINGUP_LAUNCH` | `dsr_bringup2_moveit.launch.py` | launch 파일 이름 |
