@@ -88,7 +88,8 @@ GRIP_RANGE_MM = 130.0    # RH-P12-RN-A 완전 열림(POS 0)에서 약 130mm 추�
 # 0° snap 보정 — 학습 라벨이 axis-aligned 라 검출 yaw 가 0° 부근으로 collapse 함.
 # 실제 흩뿌려진 cube 는 거의 0° 가 아니므로, 검출이 0° 근처면 작은 회전 부여.
 YAW_NEAR_ZERO_THR_DEG = 15.0     # |yaw| 이값 이내면 "0° 로 잘못 snap" 으로 간주 (자주 발동)
-YAW_NEAR_ZERO_BIAS_DEG = 10.0    # 위 경우에 사용할 회전량 (부호는 첫 두 변 중 finger clearance 좋은 쪽)
+YAW_NEAR_ZERO_BIAS_DEG = 15.0    # 위 경우에 사용할 회전량 (부호는 첫 두 변 중 finger clearance 좋은 쪽)
+
 
 # 모션
 Z_APPROACH = 80.0
@@ -876,6 +877,7 @@ def execute_one_cycle(robot, target, cell_xy, args):
           f'→ cell ({cell_xy[0]:.0f}, {cell_xy[1]:.0f})')
 
     pick_rpy = [0.0, 180.0, yaw_used]
+    # 모든 cube 는 grid 에 yaw=0° 로 release — 다음 단계(탑쌓기 등) 가 axis-aligned 가정.
     place_rpy = [0.0, 180.0, 0.0]
 
     # cube 옆면 그립을 위해 cube 중심 z 로 내려감 (검출 z = cube 윗면 가정)

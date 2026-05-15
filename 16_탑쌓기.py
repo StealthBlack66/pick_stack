@@ -52,7 +52,7 @@ TOWER2_LAYOUT = [               # (x_offset_from_center, layer_idx)
     (-12.5, 1), (+12.5, 1),               # 중간 2개 (valley 안착)
     (0.0, 2),                             # 꼭대기 1개
 ]
-STACK_PICK_YAW_OFFSET = 90.0    # pick yaw = cube 현재 yaw + 이값 (양축 정렬용)
+STACK_PICK_YAW_OFFSET = -90.0   # pick yaw = cube 현재 yaw + 이값 (양축 정렬용). TCP offset 검증 위해 -90 시도
 # Tower1 (수직 stack): 옆 cube 없음 → place_yaw=0° (pick 90° 와 다름 → rotate 중 friction 정렬)
 # Tower2 (피라미드 row): 옆 cube 25mm 접촉 → 그리퍼 body 의 좁은 면이 row 방향 보게 place_yaw=90°
 TOWER1_PLACE_YAW = 0.0
@@ -164,17 +164,21 @@ def build_towers(robot, dets, args):
         return STACK_PICK_YAW_OFFSET
 
     # ---- Tower 1: 수직 5층 ----
-    # 각 cube 의 실제 검출 XY 로 pick → 그리퍼가 실제 cube 중심에 내려감 → 정확한 centering
+    # 그리드 셀 좌표로 pick (결정적) — 검출 위치는 매칭 확인용으로만 로그.
+    # 15번이 placement 후 cube 가 셀에서 살짝 drift 해도 그리드 90° 가정과 cube 실제 yaw 가
+    # 어긋나면 finger 가 모서리에 닿아 비뚤어지므로, 그리드 좌표를 신뢰원으로 사용.
     print(f'\n--- Tower 1 (수직 5층) at {TOWER1_XY} ---')
     for layer in range(TOWER1_LAYERS):
         cube = matched[layer]
-        cx, cy, _ = cube['base_xyz_mm']
+        cx_det, cy_det, _ = cube['base_xyz_mm']
+        cx, cy = grid_cells[layer]
+        drift_mm = math.hypot(cx - cx_det, cy - cy_det)
         src = (cx, cy, sample_z)
         src_yaw = _pick_yaw_for(cube)
         target_center_z = z_table_top + p15.CUBE_WIDTH_MM / 2.0 + p15.CUBE_WIDTH_MM * layer
         target = (TOWER1_XY[0], TOWER1_XY[1], target_center_z)
         print(f'\n[Tower1 layer {layer + 1}/{TOWER1_LAYERS}] '
-              f'detected ({cx:.0f},{cy:.0f}) → '
+              f'grid({cx:.0f},{cy:.0f}) [det({cx_det:.0f},{cy_det:.0f}) Δ={drift_mm:.0f}mm] → '
               f'({TOWER1_XY[0]:.0f},{TOWER1_XY[1]:.0f}) center z={target_center_z:.0f}'
               f'  pick={src_yaw:+.0f}° place={TOWER1_PLACE_YAW:+.0f}°')
         execute_stack_pick_place(robot, src, src_yaw, target, TOWER1_PLACE_YAW, args,
@@ -185,8 +189,11 @@ def build_towers(robot, dets, args):
           f'(place_yaw={TOWER2_PLACE_YAW:+.0f}°, row 충돌 회피) ---')
     next_cell = TOWER1_LAYERS
     for slot, (x_off, layer) in enumerate(TOWER2_LAYOUT):
-        cube = matched[next_cell + slot]
-        cx, cy, _ = cube['base_xyz_mm']
+        cube_idx = next_cell + slot
+        cube = matched[cube_idx]
+        cx_det, cy_det, _ = cube['base_xyz_mm']
+        cx, cy = grid_cells[cube_idx]
+        drift_mm = math.hypot(cx - cx_det, cy - cy_det)
         src = (cx, cy, sample_z)
         src_yaw = _pick_yaw_for(cube)
         target_x = TOWER2_XY[0] + x_off
@@ -194,7 +201,7 @@ def build_towers(robot, dets, args):
         target_center_z = z_table_top + p15.CUBE_WIDTH_MM / 2.0 + p15.CUBE_WIDTH_MM * layer
         target = (target_x, target_y, target_center_z)
         print(f'\n[Tower2 slot {slot + 1}/{len(TOWER2_LAYOUT)} layer {layer}] '
-              f'detected ({cx:.0f},{cy:.0f}) → '
+              f'grid({cx:.0f},{cy:.0f}) [det({cx_det:.0f},{cy_det:.0f}) Δ={drift_mm:.0f}mm] → '
               f'({target_x:.0f},{target_y:.0f}) center z={target_center_z:.0f}'
               f'  pick={src_yaw:+.0f}° place={TOWER2_PLACE_YAW:+.0f}°')
         execute_stack_pick_place(robot, src, src_yaw, target, TOWER2_PLACE_YAW, args,

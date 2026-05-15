@@ -92,6 +92,15 @@ FORCE_MIN = 0
 FORCE_MAX = 2047
 FORCE_STEP = 50
 
+# RH-P12-RN-A Modbus 레지스터 (e-Manual). 표 주소 - 40001 = wire 주소.
+#   256 0x0100 1B  RW  Torque Enable      (table 40257)
+#   275 0x0113 2B  RW  Goal Current       (table 40276)
+#   282 0x011A 4B  RW  Goal Position      (table 40283)
+#   287 0x011F 2B  R   Present Current    (table 40288, signed mA, ±1984)
+#   290 0x0122 4B  R   Present Position   (table 40291, uint32, 0~700)
+ADDR_PRESENT_CURRENT  = 287
+ADDR_PRESENT_POSITION = 290
+
 FORCE_PRESETS = {
     '1': (50,   '매우 부드러움'),
     '2': (100,  '부드러움'),
@@ -508,8 +517,10 @@ class GripperKeyController(Node):
         if not self._write_frame(fc06_torque_enable(1)):
             print('  [echo] write 자체 실패')
             return
-        time.sleep(0.5)
-        resp = self._read_response(timeout=1.0)
+        # DRCF v2.10.03.00 / DRFL v1.33.03 환경에서 read 응답 지연 가능성 — 두산 공식 gripper.py 수준의 여유 부여
+        print('  [echo] RX 대기 1.5초 → flange_serial_read timeout 3초로 호출...')
+        time.sleep(1.5)
+        resp = self._read_response(timeout=3.0)
         if resp:
             print(f'  [echo] 응답: len={len(resp)}  hex={resp.hex()}')
             if len(resp) >= 8 and resp[0] == SLAVE_ID and resp[1] == 0x06:
@@ -648,37 +659,43 @@ class GripperKeyController(Node):
                 'p_contact': p_contact, 'p_high': p_high, 'delta': delta}
 
     def read_status_chunk(self):
-        """274번 레지스터부터 4개(Present Current, Goal Current, Present Position)를 한 번에 읽음"""
-        if not self._write_frame(fc_read(274, 4, 0x03)):
-            return None, None
-        
-        # 타임아웃을 짧게 주어 빠른 로깅 유도
-        resp = self._read_response(timeout=0.08)
-        if len(resp) >= 13: # 3 + 8 + 2
-            raw_cur = (resp[3] << 8) | resp[4]
-            if raw_cur > 32767:
-                raw_cur -= 65536
-            raw_pos = (resp[7] << 8) | resp[8]
-            return raw_pos, raw_cur
-            
-        # 한 번에 4개 읽기가 지원 안 되거나 통신 실패 시 개별 읽기 시도
-        if not self._write_frame(fc_read(276, 2, 0x03)):
-            return None, None
-        resp_p = self._read_response(timeout=0.08)
-        
-        if not self._write_frame(fc_read(274, 1, 0x03)):
-            return None, None
-        resp_c = self._read_response(timeout=0.08)
-        
+        """Present Current(mA) + Present Position(0~700) 동시 읽기.
+
+        Modbus FC03 한 트랜잭션으로 reg 287..290 (4 regs = 8 byte) 읽음.
+          [0..1] Present Current   2B signed   mA
+          [2..3] Present Velocity  2B signed   (사용 안 함)
+          [4..7] Present Position  4B uint32   0~700
+
+        실패 시 개별 read 폴백.
+        반환: (position, current_mA), 실패 항목은 None.
+        """
+        # 1) 4-reg 일괄 읽기 (응답 = SID + FC + bc(=8) + 8B data + 2B CRC = 13B)
+        #    DRCF v2.10.03.00 / DRFL v1.33.03 에서 RX 캡처가 느릴 가능성이 있어
+        #    write→read 사이 80ms settle, read timeout 500ms 사용.
+        if self._write_frame(fc_read(ADDR_PRESENT_CURRENT, 4, 0x03)):
+            time.sleep(0.08)
+            r = self._read_response(timeout=0.5)
+            if (len(r) >= 13 and r[0] == SLAVE_ID
+                    and r[1] == 0x03 and r[2] == 8):
+                cur = (r[3] << 8) | r[4]
+                if cur > 32767:
+                    cur -= 65536
+                pos = (r[7] << 24) | (r[8] << 16) | (r[9] << 8) | r[10]
+                return pos, cur
+
+        # 2) 폴백: 개별 읽기
         pos = cur = None
-        if len(resp_p) >= 9:
-            pos = (resp_p[3] << 8) | resp_p[4]
-        if len(resp_c) >= 7:
-            raw_cur = (resp_c[3] << 8) | resp_c[4]
-            if raw_cur > 32767:
-                raw_cur -= 65536
-            cur = raw_cur
-            
+        if self._write_frame(fc_read(ADDR_PRESENT_CURRENT, 1, 0x03)):
+            time.sleep(0.08)
+            rc = self._read_response(timeout=0.5)
+            if len(rc) >= 7 and rc[1] == 0x03:
+                raw = (rc[3] << 8) | rc[4]
+                cur = raw - 65536 if raw > 32767 else raw
+        if self._write_frame(fc_read(ADDR_PRESENT_POSITION, 2, 0x03)):
+            time.sleep(0.08)
+            rp = self._read_response(timeout=0.5)
+            if len(rp) >= 9 and rp[1] == 0x03:
+                pos = (rp[3] << 24) | (rp[4] << 16) | (rp[5] << 8) | rp[6]
         return pos, cur
 
     def plot_material_property(self):

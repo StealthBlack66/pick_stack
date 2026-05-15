@@ -43,6 +43,7 @@ def _load(name, filename):
 p12 = _load('p12', '12_비전_피크앤플레이스.py')
 p15 = _load('p15', '15_바둑판_정렬.py')
 p16 = _load('p16', '16_탑쌓기.py')
+p17t = _load('p17t', '17_test.py')   # 자동 모드 (--auto) 용 build_art_autonomous 제공
 
 
 # ===== 모양 정의 =====
@@ -293,6 +294,8 @@ def main():
     ap.add_argument('--conf', type=float, default=p15.DETECT_CONF_THR,
                     help=f'YOLO 검출 conf 임계 (default {p15.DETECT_CONF_THR})')
     ap.add_argument('--debug-img', type=str, default='/tmp/art_debug.png')
+    ap.add_argument('--auto', action='store_true',
+                    help='완전 자동 모드 — 매 cube 마다 비전 재인식 (17_test.py 의 build_art_autonomous)')
     args = ap.parse_args()
 
     print(f'=== 미술 쌓기 시작 (shape={args.shape}) ===')
@@ -379,7 +382,12 @@ def main():
             return
 
         if args.shape == 'double_stack':
+            if args.auto:
+                print('  !! --auto 는 double_stack 미지원 — 반자동(build_multi_stack)으로 진행')
             build_multi_stack(robot, dets, args)
+        elif args.auto:
+            print(f'\n[AUTO] 완전 자동 모드 — 매 cube 마다 재인식 (shape={args.shape})')
+            p17t.build_art_autonomous(robot, vision, args.shape, args)
         else:
             build_art(robot, dets, args.shape, args)
 
