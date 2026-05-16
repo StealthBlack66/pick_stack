@@ -43,7 +43,9 @@ p16 = _get_or_load('p16', '16_탑쌓기.py')
 # 모듈 top-level 에서 가져오면 순환 import (17_test ↔ 17_미술쌓기) 발생.
 def _shape_consts():
     import __main__ as c
-    return c.SHAPES, c.SHAPE_BASE_XY, c.ART_PITCH_MM, c.SHAPE_PITCH_MM, c.ART_PLACE_YAW
+    return (c.SHAPES, c.SHAPE_BASE_XY, c.ART_PITCH_MM,
+            c.SHAPE_PITCH_MM, c.ART_PLACE_YAW, c.ART_PICK_YAW,
+            c.ART_PRE_OPEN_WIDTH_MM)
 
 
 def get_realtime_detections(vision, robot, args):
@@ -77,7 +79,9 @@ def get_realtime_detections(vision, robot, args):
 
 def build_art_autonomous(robot, vision, shape_name, args):
     """자동 인식 기반 쌓기 메인 루프"""
-    SHAPES, SHAPE_BASE_XY, ART_PITCH_MM, SHAPE_PITCH_MM, ART_PLACE_YAW = _shape_consts()
+    (SHAPES, SHAPE_BASE_XY, ART_PITCH_MM,
+     SHAPE_PITCH_MM, ART_PLACE_YAW, ART_PICK_YAW,
+     ART_PRE_OPEN_WIDTH_MM) = _shape_consts()
     layout = SHAPES[shape_name]
     need_count = len(layout)
     pitch = SHAPE_PITCH_MM.get(shape_name, ART_PITCH_MM)
@@ -115,8 +119,9 @@ def build_art_autonomous(robot, vision, shape_name, args):
         
         # 4. 실행
         p16.execute_stack_pick_place(
-            robot, src, p16.STACK_PICK_YAW_OFFSET, target, yaw,
-            args, z_table_top=z_table_top
+            robot, src, ART_PICK_YAW, target, yaw,
+            args, z_table_top=z_table_top,
+            pre_open_width_mm=ART_PRE_OPEN_WIDTH_MM,
         )
 
     print(f'\n=== "{shape_name}" 자동 조립 프로세스 종료 ===')

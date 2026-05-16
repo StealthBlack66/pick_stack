@@ -103,13 +103,67 @@ SHAPES = {
         (0.0, 0.0, 0, 90.0),
         (1.0, 1.0, 0, 90.0),
         (2.0, 2.0, 0, 90.0),
-        
+
         # 2층: 계곡 중앙 (0.5, 0.5) 와 (1.5, 1.5)
         (0.5, 0.5, 1, 90.0),
         (1.5, 1.5, 1, 90.0),
-        
+
         # 3층: 꼭대기 (1.0, 1.0)
         (1.0, 1.0, 2, 90.0),
+    ],
+
+    # 4 cubes × 3 layers 원형 탑 — 각 cube 가 원의 중심점을 바라보도록 yaw = 자기 각도
+    # 4개 cube 가 0°/90°/180°/270° 에 배치되어 면이 중심을 향함 (parallel-jaw 4-fold 대칭이라
+    # 시각적으로 모두 axis-aligned 로 보이지만 의도된 회전 적용됨).
+    # 반경 R=1.0 grid_unit → ART_PITCH_MM(27mm) 만큼 중심에서 떨어짐. 인접 cube 거리 ≈38mm.
+    'circle_tower_4': [
+        # Layer 0 (바닥)
+        (math.cos(math.radians(0)),   math.sin(math.radians(0)),   0,   0.0),  # 우 (3시)
+        (math.cos(math.radians(90)),  math.sin(math.radians(90)),  0,  90.0),  # 상 (12시)
+        (math.cos(math.radians(180)), math.sin(math.radians(180)), 0, 180.0),  # 좌 (9시)
+        (math.cos(math.radians(270)), math.sin(math.radians(270)), 0, 270.0),  # 하 (6시)
+        # Layer 1 (중간)
+        (math.cos(math.radians(0)),   math.sin(math.radians(0)),   1,   0.0),
+        (math.cos(math.radians(90)),  math.sin(math.radians(90)),  1,  90.0),
+        (math.cos(math.radians(180)), math.sin(math.radians(180)), 1, 180.0),
+        (math.cos(math.radians(270)), math.sin(math.radians(270)), 1, 270.0),
+        # Layer 2 (꼭대기)
+        (math.cos(math.radians(0)),   math.sin(math.radians(0)),   2,   0.0),
+        (math.cos(math.radians(90)),  math.sin(math.radians(90)),  2,  90.0),
+        (math.cos(math.radians(180)), math.sin(math.radians(180)), 2, 180.0),
+        (math.cos(math.radians(270)), math.sin(math.radians(270)), 2, 270.0),
+    ],
+
+    # 사용자 지정 정육각형 (Pointy-topped, 3층 brick-pattern, 총 18개)
+    # 반경 35.15mm — 인접 cube 거리 = 반경 = 35.15mm.
+    # 각 cube 면이 tangent 방향 (yaw = 위치 각도 - 90°, ±90° 등가):
+    #   Layer 0 위치: 0°, 60°, 120°, 180°, 240°, 300° / yaws: -90, -30, 30, -90, -30, 30
+    #   Layer 1 위치: +30° 회전 (30°, 90°, 150°, 210°, 270°, 330°) / yaws: -60, 0, 60, -60, 0, 60
+    #   Layer 2 위치: +60° = Layer 0 와 동일 (60°, 120°, ..., 360°) / yaws 동일 패턴
+    'hexagon_6': [
+        # Layer 0 (바닥)
+        ( (35.15/27.0) * math.cos(math.radians(0)),   (35.15/27.0) * math.sin(math.radians(0)),   0, -90.0),
+        ( (35.15/27.0) * math.cos(math.radians(60)),  (35.15/27.0) * math.sin(math.radians(60)),  0, -30.0),
+        ( (35.15/27.0) * math.cos(math.radians(120)), (35.15/27.0) * math.sin(math.radians(120)), 0,  30.0),
+        ( (35.15/27.0) * math.cos(math.radians(180)), (35.15/27.0) * math.sin(math.radians(180)), 0, -90.0),
+        ( (35.15/27.0) * math.cos(math.radians(240)), (35.15/27.0) * math.sin(math.radians(240)), 0, -30.0),
+        ( (35.15/27.0) * math.cos(math.radians(300)), (35.15/27.0) * math.sin(math.radians(300)), 0,  30.0),
+
+        # Layer 1 (위치 +30° 회전, brick pattern)
+        ( (35.15/27.0) * math.cos(math.radians(30)),  (35.15/27.0) * math.sin(math.radians(30)),  1, -60.0),
+        ( (35.15/27.0) * math.cos(math.radians(90)),  (35.15/27.0) * math.sin(math.radians(90)),  1,   0.0),
+        ( (35.15/27.0) * math.cos(math.radians(150)), (35.15/27.0) * math.sin(math.radians(150)), 1,  60.0),
+        ( (35.15/27.0) * math.cos(math.radians(210)), (35.15/27.0) * math.sin(math.radians(210)), 1, -60.0),
+        ( (35.15/27.0) * math.cos(math.radians(270)), (35.15/27.0) * math.sin(math.radians(270)), 1,   0.0),
+        ( (35.15/27.0) * math.cos(math.radians(330)), (35.15/27.0) * math.sin(math.radians(330)), 1,  60.0),
+
+        # Layer 2 (위치 +60° = Layer 0 와 동일 XY)
+        ( (35.15/27.0) * math.cos(math.radians(60)),  (35.15/27.0) * math.sin(math.radians(60)),  2, -30.0),
+        ( (35.15/27.0) * math.cos(math.radians(120)), (35.15/27.0) * math.sin(math.radians(120)), 2,  30.0),
+        ( (35.15/27.0) * math.cos(math.radians(180)), (35.15/27.0) * math.sin(math.radians(180)), 2, -90.0),
+        ( (35.15/27.0) * math.cos(math.radians(240)), (35.15/27.0) * math.sin(math.radians(240)), 2, -30.0),
+        ( (35.15/27.0) * math.cos(math.radians(300)), (35.15/27.0) * math.sin(math.radians(300)), 2,  30.0),
+        ( (35.15/27.0) * math.cos(math.radians(360)), (35.15/27.0) * math.sin(math.radians(360)), 2, -90.0),
     ],
 }
 
@@ -127,6 +181,13 @@ SHAPE_PITCH_MM = {
 # place yaw — row 충돌 회피 위해 90° (16번 Tower2 와 동일 논리)
 ART_PLACE_YAW = 90.0
 
+# pick yaw — 미술쌓기는 16번 STACK_PICK_YAW_OFFSET (=-90°) 와 무관하게 항상 90°.
+# (16번 탑쌓기 의 TCP offset 실험과 분리해서 미술쌓기 picking yaw 를 고정)
+ART_PICK_YAW = 90.0
+
+# pick 전 그리퍼 벌리는 폭 — 미술쌓기는 40mm 로 고정 (cube 25mm + 양옆 7.5mm 여유).
+ART_PRE_OPEN_WIDTH_MM = 40.0
+
 
 def build_art(robot, dets, shape_name, args):
     """선택된 모양을 검출 cube 들로 조립."""
@@ -140,11 +201,43 @@ def build_art(robot, dets, shape_name, args):
         print(f'\n!! "{shape_name}" SKIP — 검출 cube {len(dets)}개 < 필요 {need}개')
         return
 
-    # Y → X 순으로 검출 cube 정렬 (그리드 좌상→우→다음행 순서)
-    sorted_dets = sorted(dets, key=lambda d: (d['base_xyz_mm'][1], d['base_xyz_mm'][0]))
-    cubes = sorted_dets[:need]
+    # 그리드 셀 좌표를 신뢰원으로 사용 (15번이 cube 를 이 좌표에 놓음). 검출 결과는 셀별
+    # cube 존재 확인 + drift 모니터링 용으로만 사용 — pick 은 항상 grid_cells[i] 로 감.
+    # 전체 25 cell 중 cube 가 있는 셀을 grid 순서대로 need 개 수집 (cube 가 cell 0~N-1 에
+    # 모두 있을 필요 X — 사용자가 어떤 cell 들에 놓아도 첫 need 개의 매칭만 사용).
+    grid_cells = p15.make_grid_cells()
+    if len(grid_cells) < need:
+        print(f'\n!! 그리드 cell {len(grid_cells)}개 < 필요 {need}개 — 종료')
+        return
 
-    sample_z = float(np.median([c['base_xyz_mm'][2] for c in cubes]))
+    MATCH_RADIUS_MM = 40.0
+    matched_cubes = []
+    matched_cell_indices = []
+    for i in range(len(grid_cells)):
+        if len(matched_cubes) >= need:
+            break
+        cell = grid_cells[i]
+        closest, best_d = None, MATCH_RADIUS_MM
+        for d in dets:
+            bx, by, _ = d['base_xyz_mm']
+            dd = math.hypot(bx - cell[0], by - cell[1])
+            if dd < best_d:
+                best_d, closest = dd, d
+        if closest is not None:
+            matched_cubes.append(closest)
+            matched_cell_indices.append(i)
+
+    if len(matched_cubes) < need:
+        print(f'\n!! 그리드에서 매칭된 cube {len(matched_cubes)}개 < 필요 {need}개 '
+              f'({MATCH_RADIUS_MM:.0f}mm 이내). "{shape_name}" 조립 중단')
+        return
+    print(f'  ── grid → cube 매칭 결과: {len(matched_cubes)}개 cell 사용 ──')
+    for k, i in enumerate(matched_cell_indices):
+        cx, cy = grid_cells[i]
+        bx, by, _ = matched_cubes[k]['base_xyz_mm']
+        print(f'    [{k:2d}] cell[{i:2d}] ({cx:+7.1f}, {cy:+7.1f})  ← det ({bx:+7.1f}, {by:+7.1f})')
+
+    sample_z = float(np.median([c['base_xyz_mm'][2] for c in matched_cubes]))
     z_table_top = sample_z - p15.CUBE_WIDTH_MM
     # 모양별 pitch (기본 ART_PITCH_MM, 특수 모양은 SHAPE_PITCH_MM 에서 오버라이드)
     pitch = SHAPE_PITCH_MM.get(shape_name, ART_PITCH_MM)
@@ -154,25 +247,38 @@ def build_art(robot, dets, shape_name, args):
     # 레이아웃을 layer 오름차순 → y → x 로 정렬 (바닥부터, 뒤에서 앞으로)
     layout_sorted = sorted(enumerate(layout), key=lambda e: (e[1][2], e[1][1], e[1][0]))
 
+    # neighbor-aware pick yaw 를 위한 cell 좌표 (실제 매칭된 cell 만) + 진행 상태
+    cell_positions = [grid_cells[ci] for ci in matched_cell_indices]
+    used_cells = set()
+
     for order_idx, (_orig_i, item) in enumerate(layout_sorted):
         gx = item[0]
         gy = item[1]
         layer = item[2]
         yaw = item[3] if len(item) > 3 else ART_PLACE_YAW
 
-        cube = cubes[order_idx]
-        cx, cy, _ = cube['base_xyz_mm']
+        cube = matched_cubes[order_idx]
+        cx_det, cy_det, _ = cube['base_xyz_mm']
+        cell_idx = matched_cell_indices[order_idx]
+        cx, cy = grid_cells[cell_idx]             # ← 실제 매칭된 그리드 셀 좌표로 pick
+        drift_mm = math.hypot(cx - cx_det, cy - cy_det)
         src = (cx, cy, sample_z)
+        # 인접 cell 에 cube 가 남아있으면 finger 충돌 피하는 방향 자동 선택
+        pick_yaw = p15.pick_yaw_for_grid_cell(order_idx, cell_positions, ART_PICK_YAW, used_cells)
         target_x = SHAPE_BASE_XY[0] + gx * pitch
         target_y = SHAPE_BASE_XY[1] + gy * pitch
-        target_center_z = z_table_top + p15.CUBE_WIDTH_MM / 2.0 + p15.CUBE_WIDTH_MM * layer
+        # [핵심] 1층(Layer 0)은 비전으로 측정한 큐브 중심 높이(sample_z)와 동일한 높이로 내려놓습니다.
+        # 기존에는 테이블 기준(z_table_top)으로 다시 계산하여 실제 잡은 높이보다 낮게(테이블 안으로) 내려가려던 문제를 해결했습니다.
+        target_center_z = sample_z + layer * p15.CUBE_WIDTH_MM
         target = (target_x, target_y, target_center_z)
         print(f'\n[{order_idx + 1}/{need}] layer{layer} grid({gx:+.1f},{gy:+.1f}) → '
               f'mm({target_x:.0f},{target_y:.0f},z={target_center_z:.0f})  '
-              f'pick from ({cx:.0f},{cy:.0f})')
+              f'pick cell[{cell_idx}]({cx:.0f},{cy:.0f}) yaw={pick_yaw:+.0f}° '
+              f'[det({cx_det:.0f},{cy_det:.0f}) Δ={drift_mm:.0f}mm]')
         p16.execute_stack_pick_place(
-            robot, src, p16.STACK_PICK_YAW_OFFSET, target, yaw,
-            args, z_table_top=z_table_top)
+            robot, src, pick_yaw, target, yaw,
+            args, z_table_top=z_table_top, pre_open_width_mm=ART_PRE_OPEN_WIDTH_MM)
+        used_cells.add(order_idx)
 
     print(f'\n=== "{shape_name}" 조립 완료 ===')
 
@@ -180,15 +286,44 @@ def build_art(robot, dets, shape_name, args):
 def build_multi_stack(robot, dets, args):
     """2칸 블럭을 가조립하여 한 번에 잡는 멀티 그랩(Multi-Grab) 로직.
     3층짜리 3열 벽을 쌓습니다. (총 9개 소요)
+
+    pick 좌표는 항상 grid_cells[i] (15번이 cube 를 놓은 결정적 좌표) 사용.
+    검출 결과는 셀에 cube 존재 확인 + drift 모니터링 용.
     """
     need = 9
     if len(dets) < need:
         print(f'\n!! "double_stack" SKIP — 검출 cube {len(dets)}개 < 필요 {need}개')
         return
 
-    sorted_dets = sorted(dets, key=lambda d: (d['base_xyz_mm'][1], d['base_xyz_mm'][0]))
-    cubes = sorted_dets[:need]
-    sample_z = float(np.median([c['base_xyz_mm'][2] for c in cubes]))
+    grid_cells = p15.make_grid_cells()
+    if len(grid_cells) < need:
+        print(f'\n!! 그리드 cell {len(grid_cells)}개 < 필요 {need}개 — 종료')
+        return
+
+    # 전체 grid cell 중 cube 가 있는 것을 순서대로 need 개 수집 (cells 0~N-1 강제 X)
+    MATCH_RADIUS_MM = 40.0
+    matched_cubes = []
+    matched_cell_indices = []
+    for i in range(len(grid_cells)):
+        if len(matched_cubes) >= need:
+            break
+        cell = grid_cells[i]
+        closest, best_d = None, MATCH_RADIUS_MM
+        for d in dets:
+            bx, by, _ = d['base_xyz_mm']
+            dd = math.hypot(bx - cell[0], by - cell[1])
+            if dd < best_d:
+                best_d, closest = dd, d
+        if closest is not None:
+            matched_cubes.append(closest)
+            matched_cell_indices.append(i)
+
+    if len(matched_cubes) < need:
+        print(f'\n!! 매칭된 cube {len(matched_cubes)}개 < 필요 {need}개 '
+              f'({MATCH_RADIUS_MM:.0f}mm 이내) — double_stack 중단')
+        return
+
+    sample_z = float(np.median([c['base_xyz_mm'][2] for c in matched_cubes]))
     z_table_top = sample_z - p15.CUBE_WIDTH_MM
 
     print(f'\n=== "double_stack" 멀티 그랩 조립 시작 ({need} cubes) ===')
@@ -197,52 +332,56 @@ def build_multi_stack(robot, dets, args):
     STAGING_Y = SHAPE_BASE_XY[1]
     stage_z = z_table_top + p15.CUBE_WIDTH_MM / 2.0
 
+    # neighbor-aware pick yaw 를 위한 cell 좌표 (실제 매칭된 cell 만) + 진행 상태
+    cell_positions = [grid_cells[ci] for ci in matched_cell_indices]
+    used_cells = set()
+
+    def _pick_one(idx, place_xyz, place_yaw):
+        cell_idx = matched_cell_indices[idx]
+        x, y = grid_cells[cell_idx]
+        src = (x, y, sample_z)
+        pick_yaw = p15.pick_yaw_for_grid_cell(idx, cell_positions, ART_PICK_YAW, used_cells)
+        p16.execute_stack_pick_place(robot, src, pick_yaw, place_xyz, place_yaw,
+                                     args, z_table_top=z_table_top,
+                                     pre_open_width_mm=ART_PRE_OPEN_WIDTH_MM)
+        used_cells.add(idx)
+
     cube_idx = 0
 
     for layer in range(3):
         # 층마다 교차 쌓기 (Interleaved: 0,2층은 왼쪽 2블럭+우측 1블럭 / 1층은 왼쪽 1블럭+우측 2블럭)
         target_z = z_table_top + p15.CUBE_WIDTH_MM / 2.0 + p15.CUBE_WIDTH_MM * layer
-        
+
         if layer % 2 == 0:
             # 1. 가조립 2-block (left & mid)
-            c1 = cubes[cube_idx]; cube_idx += 1
-            c2 = cubes[cube_idx]; cube_idx += 1
             stage_y1 = STAGING_Y - ART_PITCH_MM / 2.0
             stage_y2 = STAGING_Y + ART_PITCH_MM / 2.0
-            
-            p16.execute_stack_pick_place(robot, c1['base_xyz_mm'], p16.STACK_PICK_YAW_OFFSET,
-                                         (STAGING_X, stage_y1, stage_z), ART_PLACE_YAW, args, z_table_top=z_table_top)
-            p16.execute_stack_pick_place(robot, c2['base_xyz_mm'], p16.STACK_PICK_YAW_OFFSET,
-                                         (STAGING_X, stage_y2, stage_z), ART_PLACE_YAW, args, z_table_top=z_table_top)
-            
+
+            _pick_one(cube_idx, (STAGING_X, stage_y1, stage_z), ART_PLACE_YAW); cube_idx += 1
+            _pick_one(cube_idx, (STAGING_X, stage_y2, stage_z), ART_PLACE_YAW); cube_idx += 1
+
             # 멀티 그랩으로 한 번에 잡아서 타겟 위치로 (중심이 타겟 좌측으로)
             multi_pick_xy = (STAGING_X, STAGING_Y)
             multi_target_xy = (SHAPE_BASE_XY[0], SHAPE_BASE_XY[1] - ART_PITCH_MM / 2.0)
             print(f'\n[Multi-Grab] layer{layer} 2-block')
             _execute_multi_grab(robot, multi_pick_xy, multi_target_xy, target_z, args, z_table_top)
-            
+
             # 2. 1-block (right)
-            c3 = cubes[cube_idx]; cube_idx += 1
-            p16.execute_stack_pick_place(robot, c3['base_xyz_mm'], p16.STACK_PICK_YAW_OFFSET,
-                                         (SHAPE_BASE_XY[0], SHAPE_BASE_XY[1] + ART_PITCH_MM, target_z),
-                                         ART_PLACE_YAW, args, z_table_top=z_table_top)
+            _pick_one(cube_idx,
+                      (SHAPE_BASE_XY[0], SHAPE_BASE_XY[1] + ART_PITCH_MM, target_z),
+                      ART_PLACE_YAW); cube_idx += 1
         else:
             # 1. 1-block (left)
-            c1 = cubes[cube_idx]; cube_idx += 1
-            p16.execute_stack_pick_place(robot, c1['base_xyz_mm'], p16.STACK_PICK_YAW_OFFSET,
-                                         (SHAPE_BASE_XY[0], SHAPE_BASE_XY[1] - ART_PITCH_MM, target_z),
-                                         ART_PLACE_YAW, args, z_table_top=z_table_top)
-                                         
+            _pick_one(cube_idx,
+                      (SHAPE_BASE_XY[0], SHAPE_BASE_XY[1] - ART_PITCH_MM, target_z),
+                      ART_PLACE_YAW); cube_idx += 1
+
             # 2. 가조립 2-block (mid & right)
-            c2 = cubes[cube_idx]; cube_idx += 1
-            c3 = cubes[cube_idx]; cube_idx += 1
             stage_y1 = STAGING_Y - ART_PITCH_MM / 2.0
             stage_y2 = STAGING_Y + ART_PITCH_MM / 2.0
-            
-            p16.execute_stack_pick_place(robot, c2['base_xyz_mm'], p16.STACK_PICK_YAW_OFFSET,
-                                         (STAGING_X, stage_y1, stage_z), ART_PLACE_YAW, args, z_table_top=z_table_top)
-            p16.execute_stack_pick_place(robot, c3['base_xyz_mm'], p16.STACK_PICK_YAW_OFFSET,
-                                         (STAGING_X, stage_y2, stage_z), ART_PLACE_YAW, args, z_table_top=z_table_top)
+
+            _pick_one(cube_idx, (STAGING_X, stage_y1, stage_z), ART_PLACE_YAW); cube_idx += 1
+            _pick_one(cube_idx, (STAGING_X, stage_y2, stage_z), ART_PLACE_YAW); cube_idx += 1
                                          
             multi_pick_xy = (STAGING_X, STAGING_Y)
             multi_target_xy = (SHAPE_BASE_XY[0], SHAPE_BASE_XY[1] + ART_PITCH_MM / 2.0)

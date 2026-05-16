@@ -39,6 +39,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from control_msgs.action import FollowJointTrajectory
+from control_msgs.msg import JointTolerance
 from trajectory_msgs.msg import JointTrajectoryPoint
 from builtin_interfaces.msg import Duration
 from dsr_msgs2.srv import (
@@ -664,7 +665,8 @@ class PickAndPlace(Node):
 
         목표 자세 한 점(t=duration) 만 보낸다. ros2_control 이 현재 위치에서 보간.
         시작점을 명시하면 timing/단위 미세 차이로 컨트롤러가 받지 않고 hang 할 수 있어 사용 X.
-        충돌 잠금은 별도의 recover_safety() 가 처리.
+        2-point cubic Hermite 도 시도했으나 Doosan PID 가 trapezoidal 외 프로파일 tracking 실패.
+        단발 endpoint + path_tolerance 완화 조합이 가장 robust.
         """
         if not self.traj_action.wait_for_server(timeout_sec=5.0):
             raise RuntimeError('FollowJointTrajectory 액션 서버 미응답 — '
@@ -679,6 +681,18 @@ class PickAndPlace(Node):
         nsec = int((duration - sec) * 1e9)
         point.time_from_start = Duration(sec=sec, nanosec=nsec)
         goal.trajectory.points = [point]
+
+        # Path tolerance 완화 — controller 의 내장 trapezoidal 보간으로도 가끔 lag.
+        # 0.25 rad(14°) 안에서 자연스러운 control loop lag 허용. 최종 도달 정확도는 별도.
+        for jn in JOINT_NAMES:
+            pt_tol = JointTolerance()
+            pt_tol.name = jn
+            pt_tol.position = 0.25
+            goal.path_tolerance.append(pt_tol)
+            g_tol = JointTolerance()
+            g_tol.name = jn
+            g_tol.position = 0.05
+            goal.goal_tolerance.append(g_tol)
 
         send_fut = self.traj_action.send_goal_async(goal)
         rclpy.spin_until_future_complete(self, send_fut, timeout_sec=10.0)
@@ -696,11 +710,12 @@ class PickAndPlace(Node):
         """관절 각도(도) 6개로 직접 이동."""
         self._send_trajectory_to_joints(joints_deg, duration)
 
-    def _send_trajectory_multi(self, waypoints_joints_deg, segment_durations, smooth_steps=10):
-        """여러 waypoint 를 한 trajectory action 으로.
-        smooth_steps >= 2 면 각 segment 를 cubic smoothstep (3t²-2t³) 곡선으로
-        sub-waypoint 분포 → segment 안에서 가속 → 정속 → 감속 (ease-in-out).
-        첫 segment 는 시작점 (현재 robot 위치) 미지라 그대로 둠 (controller 보간).
+    def _send_trajectory_multi(self, waypoints_joints_deg, segment_durations, smooth_steps=1):
+        """여러 waypoint 를 한 trajectory action 으로 — segment 사이 정지 없이 연속 모션.
+        smooth_steps < 2 (기본 1): waypoint 만 trajectory 에 담아 controller 가 알아서 보간.
+        smooth_steps >= 2: 각 segment 안에서 cubic smoothstep sub-waypoint 분포 (PATH_TOL 위험,
+          작은 값/긴 duration 에서만 사용).
+        첫 waypoint 는 시작점 (현재 robot 위치) 미지라 단일 point.
 
         waypoints_joints_deg: [[6 joint deg], ...]
         segment_durations: 각 waypoint 까지 segment 시간."""
@@ -734,6 +749,17 @@ class PickAndPlace(Node):
                     pt.time_from_start = Duration(
                         sec=int(t), nanosec=int((t - int(t)) * 1e9))
                     goal.trajectory.points.append(pt)
+
+        # Path/goal tolerance 완화 (단일 endpoint trajectory 와 동일)
+        for jn in JOINT_NAMES:
+            pt_tol = JointTolerance()
+            pt_tol.name = jn
+            pt_tol.position = 0.25
+            goal.path_tolerance.append(pt_tol)
+            g_tol = JointTolerance()
+            g_tol.name = jn
+            g_tol.position = 0.05
+            goal.goal_tolerance.append(g_tol)
 
         send_fut = self.traj_action.send_goal_async(goal)
         rclpy.spin_until_future_complete(self, send_fut, timeout_sec=10.0)

@@ -65,10 +65,15 @@ SAFE_TRAVEL_Z_ABOVE_TABLE = 250.0
 # ===== Tower Pick & Place =====
 def execute_stack_pick_place(robot, source_xyz_mm, source_yaw_deg,
                               target_center_xyz_mm, target_yaw_deg, args,
-                              z_table_top):
+                              z_table_top, pre_open_width_mm=None):
     """source (cube top z) 에서 잡아 target (cube 중심 z) 에 놓기.
     모든 cube 간 이동은 safe-z 위에서 → 탑 / 다른 cube 충돌 회피.
-    source_yaw / target_yaw 가 다르면 source 위 safe-z 에서 회전 (cube 양축 정렬용)."""
+    source_yaw / target_yaw 가 다르면 source 위 safe-z 에서 회전 (cube 양축 정렬용).
+
+    pre_open_width_mm: pick descent 전에 그리퍼 벌릴 폭(mm). None → p15.PRE_OPEN_WIDTH_MM 기본값.
+    """
+    if pre_open_width_mm is None:
+        pre_open_width_mm = p15.PRE_OPEN_WIDTH_MM
     sx, sy, sz = source_xyz_mm
     tx, ty, tz_center = target_center_xyz_mm
     safe_z = z_table_top + SAFE_TRAVEL_Z_ABOVE_TABLE
@@ -87,36 +92,45 @@ def execute_stack_pick_place(robot, source_xyz_mm, source_yaw_deg,
     transit_after_safe = [tx, ty, safe_z]
 
     dur = p15.MOVE_DURATION_SEC
-    print(f'   [Transit] over source @ safe z={safe_z:.0f} yaw={source_yaw_deg:+.0f}°')
-    if not args.dry_run: robot.move_line_base(transit_src_safe, rpy_deg=pick_rpy, duration=dur)
 
-    print('   [Pick]')
-    print(f'    1) approach {[round(v, 1) for v in approach]}')
-    if not args.dry_run: robot.move_line_base(approach, rpy_deg=pick_rpy, duration=dur)
-    print(f'    2) pre-open {p15.PRE_OPEN_WIDTH_MM:.0f}mm')
-    if not args.dry_run: p15.gripper_set_width(robot, p15.PRE_OPEN_WIDTH_MM)
-    print(f'    3) descend {[round(v, 1) for v in pick]}')
+    # Group A: transit_src_safe → approach (그리퍼 동작 없는 구간 묶기 → 정지 없음)
+    print(f'   [Group A] transit over source → approach @ safe z={safe_z:.0f} yaw={source_yaw_deg:+.0f}°')
+    if not args.dry_run:
+        robot.move_line_base_multi([
+            (transit_src_safe, pick_rpy),
+            (approach, pick_rpy),
+        ], [dur, dur])
+
+    # Gripper pre-open
+    print(f'    pre-open {pre_open_width_mm:.0f}mm')
+    if not args.dry_run: p15.gripper_set_width(robot, pre_open_width_mm)
+
+    # Group B: descend only (single segment, no group)
+    print(f'    descend {[round(v, 1) for v in pick]}')
     if not args.dry_run: robot.move_line_base(pick, rpy_deg=pick_rpy, duration=dur)
-    print(f'    4) close')
+
+    # Gripper close
+    print(f'    close')
     if not args.dry_run: p15.fast_gripper_close(robot)
-    print(f'    5) lift up to safe z {[round(v, 1) for v in transit_lift_safe]}')
-    if not args.dry_run: robot.move_line_base(transit_lift_safe, rpy_deg=pick_rpy, duration=dur)
 
+    # Group C: lift → [rotate] → transit_tgt_safe → place_app → place (5 waypoints, 끊김 없음)
+    print(f'   [Group C] lift → transit → place')
+    motion_C = [(transit_lift_safe, pick_rpy)]
     if abs(source_yaw_deg - target_yaw_deg) > 0.5:
-        print(f'    6) rotate yaw {source_yaw_deg:+.0f}° → {target_yaw_deg:+.0f}° (양축 정렬)')
-        if not args.dry_run: robot.move_line_base(transit_lift_safe, rpy_deg=place_rpy, duration=dur)
+        # 같은 XYZ 에서 yaw 만 회전
+        motion_C.append((transit_lift_safe, place_rpy))
+    motion_C.append((transit_tgt_safe, place_rpy))
+    motion_C.append((place_app, place_rpy))
+    motion_C.append((place, place_rpy))
+    if not args.dry_run:
+        robot.move_line_base_multi(motion_C, [dur] * len(motion_C))
 
-    print(f'   [Transit] to target @ safe z {[round(v, 1) for v in transit_tgt_safe]}')
-    if not args.dry_run: robot.move_line_base(transit_tgt_safe, rpy_deg=place_rpy, duration=dur)
-
-    print('   [Place]')
-    print(f'    1) descend to above target {[round(v, 1) for v in place_app]} (center z={tz_center:.0f})')
-    if not args.dry_run: robot.move_line_base(place_app, rpy_deg=place_rpy, duration=dur)
-    print(f'    2) place {[round(v, 1) for v in place]}')
-    if not args.dry_run: robot.move_line_base(place, rpy_deg=place_rpy, duration=dur)
-    print(f'    3) open {p15.RELEASE_WIDTH_MM:.0f}mm (release)')
+    # Gripper open
+    print(f'    open {p15.RELEASE_WIDTH_MM:.0f}mm (release)')
     if not args.dry_run: p15.gripper_set_width(robot, p15.RELEASE_WIDTH_MM)
-    print(f'    4) lift up to safe z {[round(v, 1) for v in transit_after_safe]}')
+
+    # Group D: lift after (single)
+    print(f'    lift to safe z {[round(v, 1) for v in transit_after_safe]}')
     if not args.dry_run:
         robot.move_line_base(transit_after_safe, rpy_deg=place_rpy, duration=dur)
 
@@ -141,48 +155,54 @@ def build_towers(robot, dets, args):
         print(f'\n!! 그리드 cell {len(grid_cells)}개 < 필요 {need}개 — 종료')
         return
 
-    # 각 cell 에 cube 있는지 검증 + 매칭된 cube 로 z 수집
+    # 전체 grid cell 중 cube 가 있는 것을 순서대로 need 개 수집 (cells 0~N-1 강제 X)
     matched = []
-    for i in range(need):
-        c = _match_cell_to_cube(grid_cells[i], dets)
-        if c is None:
-            print(f'\n!! grid cell {i} {grid_cells[i]} 에 cube 없음 — 탑 쌓기 중단')
-            return
-        matched.append(c)
+    matched_cell_indices = []
+    for i in range(len(grid_cells)):
+        if len(matched) >= need:
+            break
+        c = _match_cell_to_cube(grid_cells[i], dets, radius=40.0)
+        if c is not None:
+            matched.append(c)
+            matched_cell_indices.append(i)
+
+    if len(matched) < need:
+        print(f'\n!! 그리드에서 매칭된 cube {len(matched)}개 < 필요 {need}개 (40mm 이내) — 탑 쌓기 중단')
+        return
 
     # table 표면 z = matched cube top median - cube 두께
     sample_z = float(np.median([c['base_xyz_mm'][2] for c in matched]))
     z_table_top = sample_z - p15.CUBE_WIDTH_MM
-    print(f'\n=== 탑 쌓기 시작 (cube 11개, table z={z_table_top:.1f}mm) ===')
-    for i, c in enumerate(matched):
-        cx, cy = grid_cells[i]
-        print(f'  cell {i}: ({cx:.0f}, {cy:.0f})  ← cube 검출 z={c["base_xyz_mm"][2]:.1f}mm')
+    print(f'\n=== 탑 쌓기 시작 (cube {need}개, table z={z_table_top:.1f}mm) ===')
+    for k, c in enumerate(matched):
+        ci = matched_cell_indices[k]
+        cx, cy = grid_cells[ci]
+        print(f'  pick #{k} ← cell[{ci}]: ({cx:.0f}, {cy:.0f})  cube z={c["base_xyz_mm"][2]:.1f}mm')
 
-    # 그리드 정렬 cube 는 yaw=0 가정. 검출 노이즈(±수도)나 15번 bias 잔재 무시하고
-    # 항상 정확히 STACK_PICK_YAW_OFFSET (=90°) 로 픽킹 → 그리퍼 트는 모습 없이 수직 픽
-    def _pick_yaw_for(cube):
-        return STACK_PICK_YAW_OFFSET
+    # 그리드 정렬 cube 는 yaw=0 가정. 인접 cell 에 cube 가 있으면 finger collision 위험 →
+    # neighbor-aware: STACK_PICK_YAW_OFFSET 와 +90° 중 finger clearance 큰 쪽 자동 선택.
+    cell_positions = [grid_cells[ci] for ci in matched_cell_indices]
+    used_cells = set()
 
     # ---- Tower 1: 수직 5층 ----
-    # 그리드 셀 좌표로 pick (결정적) — 검출 위치는 매칭 확인용으로만 로그.
-    # 15번이 placement 후 cube 가 셀에서 살짝 drift 해도 그리드 90° 가정과 cube 실제 yaw 가
-    # 어긋나면 finger 가 모서리에 닿아 비뚤어지므로, 그리드 좌표를 신뢰원으로 사용.
     print(f'\n--- Tower 1 (수직 5층) at {TOWER1_XY} ---')
     for layer in range(TOWER1_LAYERS):
         cube = matched[layer]
         cx_det, cy_det, _ = cube['base_xyz_mm']
-        cx, cy = grid_cells[layer]
+        ci = matched_cell_indices[layer]
+        cx, cy = grid_cells[ci]
         drift_mm = math.hypot(cx - cx_det, cy - cy_det)
         src = (cx, cy, sample_z)
-        src_yaw = _pick_yaw_for(cube)
+        src_yaw = p15.pick_yaw_for_grid_cell(layer, cell_positions, STACK_PICK_YAW_OFFSET, used_cells)
         target_center_z = z_table_top + p15.CUBE_WIDTH_MM / 2.0 + p15.CUBE_WIDTH_MM * layer
         target = (TOWER1_XY[0], TOWER1_XY[1], target_center_z)
         print(f'\n[Tower1 layer {layer + 1}/{TOWER1_LAYERS}] '
-              f'grid({cx:.0f},{cy:.0f}) [det({cx_det:.0f},{cy_det:.0f}) Δ={drift_mm:.0f}mm] → '
+              f'cell[{ci}]({cx:.0f},{cy:.0f}) [det({cx_det:.0f},{cy_det:.0f}) Δ={drift_mm:.0f}mm] → '
               f'({TOWER1_XY[0]:.0f},{TOWER1_XY[1]:.0f}) center z={target_center_z:.0f}'
               f'  pick={src_yaw:+.0f}° place={TOWER1_PLACE_YAW:+.0f}°')
         execute_stack_pick_place(robot, src, src_yaw, target, TOWER1_PLACE_YAW, args,
                                  z_table_top=z_table_top)
+        used_cells.add(layer)
 
     # ---- Tower 2: 피라미드 3-2-1 (row 충돌 회피 위해 place_yaw=90°) ----
     print(f'\n--- Tower 2 (피라미드 3-2-1) at {TOWER2_XY} '
@@ -192,20 +212,22 @@ def build_towers(robot, dets, args):
         cube_idx = next_cell + slot
         cube = matched[cube_idx]
         cx_det, cy_det, _ = cube['base_xyz_mm']
-        cx, cy = grid_cells[cube_idx]
+        ci = matched_cell_indices[cube_idx]
+        cx, cy = grid_cells[ci]
         drift_mm = math.hypot(cx - cx_det, cy - cy_det)
         src = (cx, cy, sample_z)
-        src_yaw = _pick_yaw_for(cube)
+        src_yaw = p15.pick_yaw_for_grid_cell(cube_idx, cell_positions, STACK_PICK_YAW_OFFSET, used_cells)
         target_x = TOWER2_XY[0] + x_off
         target_y = TOWER2_XY[1]
         target_center_z = z_table_top + p15.CUBE_WIDTH_MM / 2.0 + p15.CUBE_WIDTH_MM * layer
         target = (target_x, target_y, target_center_z)
         print(f'\n[Tower2 slot {slot + 1}/{len(TOWER2_LAYOUT)} layer {layer}] '
-              f'grid({cx:.0f},{cy:.0f}) [det({cx_det:.0f},{cy_det:.0f}) Δ={drift_mm:.0f}mm] → '
+              f'cell[{ci}]({cx:.0f},{cy:.0f}) [det({cx_det:.0f},{cy_det:.0f}) Δ={drift_mm:.0f}mm] → '
               f'({target_x:.0f},{target_y:.0f}) center z={target_center_z:.0f}'
               f'  pick={src_yaw:+.0f}° place={TOWER2_PLACE_YAW:+.0f}°')
         execute_stack_pick_place(robot, src, src_yaw, target, TOWER2_PLACE_YAW, args,
                                  z_table_top=z_table_top)
+        used_cells.add(cube_idx)
 
     print('\n=== 탑 쌓기 완료 ===')
 

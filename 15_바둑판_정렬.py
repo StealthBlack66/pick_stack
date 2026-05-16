@@ -96,7 +96,7 @@ Z_APPROACH = 80.0
 Z_LIFT = 100.0
 # 한 segment 이동 시간 (12번 default 5.0 → 단축). 너무 짧으면 trajectory PATH_TOL 실패
 # 2.0 에서 status=6 (ABORTED) 발생 → 3.0 으로 늘려서 controller 가 따라잡을 시간 확보
-MOVE_DURATION_SEC = 3.0
+MOVE_DURATION_SEC = 5.0
 # 그리퍼 settle (close/open 후 모터 멈출 때까지 대기, 12번 default 1.0)
 GRIPPER_SETTLE_SEC = 0.4
 
@@ -208,8 +208,11 @@ class CubeDetector:
             d['track_id'] = best_tid
             d['locked'] = t['seen'] >= TRACK_LOCK_FRAMES
 
+        # 깜빡임 방지: locked 된 track 은 STALE_FRAMES 무관 영구 유지.
+        # 비-locked track 만 STALE_FRAMES 후 삭제 (false positive 정리).
         stale = [tid for tid, t in self._tracks.items()
-                 if self._frame_idx - t['last_seen'] > TRACK_STALE_FRAMES]
+                 if self._frame_idx - t['last_seen'] > TRACK_STALE_FRAMES
+                 and t.get('seen', 0) < TRACK_LOCK_FRAMES]
         for tid in stale:
             del self._tracks[tid]
 
@@ -654,27 +657,59 @@ class CubeDetector:
                 # 트래킹 + EMA — yaw/base/pixel 안정화 (마름모 요동 방지)
                 self._stabilize(dets)
 
+                # 깜빡임 방지: locked 된 track 중 이번 frame 에서 YOLO 가 놓친 것들을
+                # ghost detection 으로 추가 → 항상 표시 (cube 가 한번 인식되면 고정)
+                seen_tids = {d.get('track_id') for d in dets if 'track_id' in d}
+                for tid, t in self._tracks.items():
+                    if tid in seen_tids:
+                        continue
+                    if t.get('seen', 0) < TRACK_LOCK_FRAMES:
+                        continue
+                    ghost = {
+                        'base_xyz_mm': (t['center_xy'][0], t['center_xy'][1], t['base_z']),
+                        'pixel': (int(round(t['pixel'][0])), int(round(t['pixel'][1]))),
+                        'conf': 0.0,
+                        'cube_yaw_deg': t['yaw'],
+                        'yaw_src': 'lock',
+                        'track_id': tid,
+                        'locked': True,
+                        'is_ghost': True,
+                    }
+                    dets.append(ghost)
+                    draw_meta.append((None, 0.0, None))
+
                 # 그리기 (평활된 값으로 rhombus 재계산 → 화면에 표시)
                 for d, meta in zip(dets, draw_meta):
                     bbox, conf, poly = meta
-                    x1, y1, x2, y2 = bbox
+                    is_ghost = d.get('is_ghost', False)
                     d['rhombus_pts'] = self._get_projected_rhombus(
                         d['base_xyz_mm'], d['cube_yaw_deg'])
-                    cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    if poly is not None and len(poly) >= 3:
-                        cv2.polylines(vis, [poly.astype(np.int32)], True, (255, 0, 255), 1)
+                    if bbox is not None:
+                        x1, y1, x2, y2 = bbox
+                        cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        if poly is not None and len(poly) >= 3:
+                            cv2.polylines(vis, [poly.astype(np.int32)], True, (255, 0, 255), 1)
+                    else:
+                        # ghost — bbox 없음, rhombus 기준 좌상 모서리로 라벨 위치 잡기
+                        rp = d['rhombus_pts']
+                        x1 = int(rp[:, 0].min())
+                        y1 = int(rp[:, 1].min())
+                        x2 = int(rp[:, 0].max())
+                        y2 = int(rp[:, 1].max())
                     cv2.circle(vis, d['pixel'], 4, (0, 0, 255), -1)
                     if d.get('rhombus_pts') is not None:
                         thick = 3 if d.get('locked') else 1
-                        cv2.polylines(vis, [d['rhombus_pts']], True, (0, 255, 255), thick)
+                        color_rh = (180, 220, 255) if is_ghost else (0, 255, 255)
+                        cv2.polylines(vis, [d['rhombus_pts']], True, color_rh, thick)
                     yaw, yaw_src = d['cube_yaw_deg'], d.get('yaw_src', '?')
                     yaw_str = (f' y={yaw:+.0f}d[{yaw_src[0].upper()}]'
                                if yaw is not None else '')
-                    lock_str = ' LOCK' if d.get('locked') else ' trk'
+                    lock_str = ' GHOST' if is_ghost else (' LOCK' if d.get('locked') else ' trk')
+                    label_color = (200, 200, 200) if is_ghost else (0, 255, 0)
                     cv2.putText(vis,
                                 f'#{d.get("track_id", "?")} {conf:.2f}{yaw_str}{lock_str}',
                                 (x1, max(15, y1 - 5)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, label_color, 2)
                     bx, by, bz = d['base_xyz_mm']
                     cv2.putText(vis, f'({bx:.0f},{by:.0f},{bz:.0f})mm',
                                 (x1, min(color.shape[0] - 5, y2 + 14)),
@@ -724,16 +759,26 @@ class CubeDetector:
 
 
 # ===== 그리드 / Staging =====
+# 명시적 5×5 grid 좌표 (mm, base frame). 계산식이 아닌 hardcoded list — 디버그 시 코드와
+# 콘솔 출력이 100% 일치하게 함. 변경 시 GRID_ORIGIN_*/GRID_SPACING 도 함께 갱신 권장.
+GRID_CELLS = [
+    # row 0 (y=-150)
+    (350.0, -150.0), (400.0, -150.0), (450.0, -150.0), (500.0, -150.0), (550.0, -150.0),
+    # row 1 (y=-100)
+    (350.0, -100.0), (400.0, -100.0), (450.0, -100.0), (500.0, -100.0), (550.0, -100.0),
+    # row 2 (y= -50)
+    (350.0,  -50.0), (400.0,  -50.0), (450.0,  -50.0), (500.0,  -50.0), (550.0,  -50.0),
+    # row 3 (y=   0)
+    (350.0,    0.0), (400.0,    0.0), (450.0,    0.0), (500.0,    0.0), (550.0,    0.0),
+    # row 4 (y= +50)
+    (350.0,   50.0), (400.0,   50.0), (450.0,   50.0), (500.0,   50.0), (550.0,   50.0),
+]
+
+
 def make_grid_cells():
-    """[(x_mm, y_mm), ...]  GRID_ROWS x GRID_COLS 개, 좌상→우→다음행."""
-    cells = []
-    for r in range(GRID_ROWS):
-        for c in range(GRID_COLS):
-            cells.append((
-                GRID_ORIGIN_X + c * GRID_SPACING,
-                GRID_ORIGIN_Y + r * GRID_SPACING,
-            ))
-    return cells
+    """[(x_mm, y_mm), ...]  GRID_ROWS x GRID_COLS 개, 좌상→우→다음행.
+    hardcoded GRID_CELLS 반환 — 계산 X, 디버그 일관성 우선."""
+    return list(GRID_CELLS)
 
 
 def _wrap_yaw_pm90(yaw):
@@ -755,10 +800,12 @@ def pick_yaw_avoiding_neighbors(target_idx, dets, base_yaw, used_indices=None):
     cx, cy, _ = dets[target_idx]['base_xyz_mm']
     candidates = []
     for yaw_try in (base_yaw, base_yaw + 90.0):
-        # finger 위치 = cube center 의 perpendicular(yaw+90°) 방향 양쪽
-        perp_rad = math.radians(yaw_try + 90.0)
-        fdx = FINGER_DIST_MM * math.cos(perp_rad)
-        fdy = FINGER_DIST_MM * math.sin(perp_rad)
+        # blade face 위치 = cube center 에서 closing 방향 (= yaw) 으로 ±FINGER_DIST_MM
+        # (이전 버전은 yaw+90° 로 계산해서 fingertip 위치를 봤고, 그 결과 collision 판정이
+        #  실제와 90° 반대로 나옴 → neighbor 와 더 가까운 yaw 가 잘못 선택되던 버그)
+        rad = math.radians(yaw_try)
+        fdx = FINGER_DIST_MM * math.cos(rad)
+        fdy = FINGER_DIST_MM * math.sin(rad)
         f1 = (cx + fdx, cy + fdy)
         f2 = (cx - fdx, cy - fdy)
         min_clearance = float('inf')
@@ -799,6 +846,54 @@ def pick_yaw_avoiding_neighbors(target_idx, dets, base_yaw, used_indices=None):
               f'(축정렬 학습 편향 보상)')
         wrapped = biased
     return float(wrapped)
+
+
+def pick_yaw_for_grid_cell(target_idx, cell_positions, base_yaw, used_indices=None):
+    """Grid 좌표 기반 neighbor-aware pick yaw (16번/17번 용).
+    cell_positions: [(x_mm, y_mm), ...]  — 사용 중인 grid cell 좌표 리스트
+    used_indices  : 이미 픽업 완료된 cell index set (남은 cube 만 neighbor 로 고려)
+    base_yaw 와 base_yaw + 90 중 finger blade 가 neighbor 와 충돌 안 하는 쪽 선택 → ±90° wrap.
+
+    물리 모델: wrist yaw 방향 = closing 방향 (= blade face 가 cube 를 누르는 방향).
+    blade face 위치 = cube 중심에서 yaw 방향으로 ±FINGER_DIST_MM. 이 face 가 neighbor 와
+    가까우면 잡으러 descend 할 때 충돌. 따라서 max blade-to-neighbor 거리 선택.
+    """
+    used_indices = used_indices or set()
+    cx, cy = cell_positions[target_idx]
+    candidates = []
+    for yaw_try in (base_yaw, base_yaw + 90.0):
+        rad = math.radians(yaw_try)
+        fdx = FINGER_DIST_MM * math.cos(rad)
+        fdy = FINGER_DIST_MM * math.sin(rad)
+        f1 = (cx + fdx, cy + fdy)
+        f2 = (cx - fdx, cy - fdy)
+        min_clr = float('inf')
+        worst_nb = None
+        for i, (nx, ny) in enumerate(cell_positions):
+            if i == target_idx or i in used_indices:
+                continue
+            for fp in (f1, f2):
+                d = math.hypot(nx - fp[0], ny - fp[1])
+                if d < min_clr:
+                    min_clr = d
+                    worst_nb = i
+        candidates.append((yaw_try, min_clr, worst_nb))
+    base_clr = candidates[0][1]
+    max_yaw, max_clr, max_nb = max(candidates, key=lambda c: c[1])
+    # base_yaw 가 안전 (clearance ≥ FINGER_CLEARANCE_MIN_MM) 이면 시각 일관성 위해 그대로.
+    # base_yaw 가 위험할 때만 alternative 로 switch — 불필요한 yaw 변화 방지.
+    if base_clr >= FINGER_CLEARANCE_MIN_MM:
+        best_yaw, best_clr, best_nb = base_yaw, base_clr, candidates[0][2]
+    else:
+        best_yaw, best_clr, best_nb = max_yaw, max_clr, max_nb
+        if best_yaw != base_yaw:
+            print(f'    finger 회피: base yaw={base_yaw:+.1f}° clr={base_clr:.0f}mm '
+                  f'(< {FINGER_CLEARANCE_MIN_MM:.0f}mm 위험) → '
+                  f'{best_yaw:+.1f}° clr={best_clr:.0f}mm (인접 cell #{best_nb} 회피)')
+        else:
+            print(f'    !! cell #{target_idx} — 양 yaw 모두 blade 공간 부족 '
+                  f'(최대 clearance {best_clr:.0f}mm). 그대로 시도')
+    return _wrap_yaw_pm90(best_yaw)
 
 
 def find_cube_at_cell(dets, used_indices, cell_xy, radius=CELL_OCCUPIED_RADIUS_MM):
@@ -940,6 +1035,11 @@ def main():
     print(f'  그리드: {GRID_ROWS}x{GRID_COLS} = {len(grid_cells)}셀, 간격 {GRID_SPACING}mm')
     print(f'  시작 셀: ({grid_cells[0][0]:.0f}, {grid_cells[0][1]:.0f}) → '
           f'끝 셀: ({grid_cells[-1][0]:.0f}, {grid_cells[-1][1]:.0f})')
+    # 전체 25셀 좌표 명시 출력 — 17번/16번 이 잡으러 가는 좌표와 직접 대조용
+    print('  ── 전체 grid cell 좌표 (mm, base frame) ──')
+    for i, (x, y) in enumerate(grid_cells):
+        r, c = i // GRID_COLS, i % GRID_COLS
+        print(f'    cell[{i:2d}] row{r} col{c}: ({x:+7.1f}, {y:+7.1f})')
 
     if not args.quick:
         p12.reset_robot_driver()
