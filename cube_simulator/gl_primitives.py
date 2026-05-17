@@ -245,15 +245,20 @@ def draw_cube_outline(cx: float, cy: float, cz: float,
 
 def draw_gripper(cx: float, cy: float, cz: float,
                  yaw_deg: float = 0.0,
-                 finger_width: float = 8.0,
+                 finger_thickness: float = 10.0,
                  finger_height: float = 60.0,
-                 finger_depth: float = 14.0,
+                 finger_width: float = 25.0,
                  open_mm: float = 35.0,
                  body_color: tuple[float, float, float] = (0.85, 0.85, 0.90),
                  finger_color: tuple[float, float, float] = (0.30, 0.35, 0.45)) -> None:
-    """단순한 parallel-jaw 그리퍼.
+    """단순한 parallel-jaw 그리퍼 (RH-P12-RN-A 근사).
 
     (cx, cy, cz) = 그리퍼 끝 (두 finger 사이 중심). yaw_deg = z 축 회전.
+
+    finger 사양:
+        finger_thickness : yaw 축 방향 두께 (잡는 동안 큐브 옆면 마주봄). 기본 10mm.
+        finger_width     : yaw 직각 방향 폭 (잡는 면 폭, 큐브 면과 같음). 기본 25mm.
+        finger_height    : Z 방향 길이. 기본 60mm.
     """
     GL = _gl()
     GL.glPushMatrix()
@@ -261,8 +266,8 @@ def draw_gripper(cx: float, cy: float, cz: float,
     GL.glRotatef(yaw_deg, 0.0, 0.0, 1.0)
 
     # 본체 (직육면체) — finger 위쪽
-    body_w = open_mm + finger_width * 2 + 12.0
-    body_d = finger_depth + 10.0
+    body_w = open_mm + finger_thickness * 2 + 12.0
+    body_d = finger_width + 10.0
     body_h = 40.0
     bx = body_w * 0.5; by = body_d * 0.5
     bz0 = finger_height
@@ -293,10 +298,10 @@ def draw_gripper(cx: float, cy: float, cz: float,
     half = open_mm * 0.5
     for side in (-1, 1):
         fx0 = side * half
-        fx1 = fx0 + side * finger_width
+        fx1 = fx0 + side * finger_thickness
         # x 정렬
         xmin = min(fx0, fx1); xmax = max(fx0, fx1)
-        ymin = -finger_depth * 0.5; ymax = finger_depth * 0.5
+        ymin = -finger_width * 0.5; ymax = finger_width * 0.5
         zmin = 0.0; zmax = finger_height
         GL.glBegin(GL.GL_QUADS)
         # 6면

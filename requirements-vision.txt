@@ -1,0 +1,12 @@
+# 비전 검출 의존성 — 정렬 모드 (15번 바둑판 정렬) 실행 시 필요
+#
+# 설치:
+#   pip install -r requirements-sim.txt -r requirements-vision.txt
+#
+# 참고:
+#   - pyrealsense2 는 Intel RealSense SDK 가 시스템 측 설치돼 있어야 함
+#     https://github.com/IntelRealSense/librealsense
+#   - YOLO 모델 (.pt) 은 별도로 다운로드 또는 학습 결과 사용
+opencv-python>=4.5
+ultralytics>=8.0
+pyrealsense2>=2.50

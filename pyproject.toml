@@ -1,0 +1,73 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cube-simulator"
+version = "0.2.0"
+description = "큐브 적층 시뮬레이터 — 두산 E0509 + RH-P12-RN-A 픽앤플레이스 GUI"
+readme = "SIMULATOR_README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "namsanghoon", email = "nbatttt@gmail.com"},
+]
+keywords = ["doosan", "robot", "simulator", "pick-and-place", "cube-stacking", "pyqt5", "opengl"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: Education",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.10",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Education",
+]
+
+# 시뮬·디자인만 — 다른 컴퓨터에서 가장 가볍게 동작.
+# 정렬·실 로봇 동작은 [vision] / [robot] extra 또는 별도 ROS2 환경 필요.
+dependencies = [
+    "PyQt5>=5.15",
+    "PyOpenGL>=3.1.0",
+    "numpy>=1.21",
+]
+
+[project.optional-dependencies]
+# 비전 검출 — 정렬 모드에서 RealSense + YOLO 사용 시
+vision = [
+    "opencv-python>=4.5",
+    "ultralytics>=8.0",
+    "pyrealsense2>=2.50",
+]
+# 실 로봇 모드 — vision + Doosan ROS2 패키지 (ROS2 측은 별도 apt 설치 필요).
+# Python 패키지로 설치 불가능한 ROS2 (rclpy 등) 는 시스템 ROS2 humble 설치 가정.
+robot = [
+    "cube-simulator[vision]",
+    "python-dotenv>=1.0",   # .env 자동 로드 (있으면 사용)
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-qt>=4.0",
+]
+
+[project.scripts]
+# 명령행에서 `cube-simulator` 또는 `cube-sim` 으로 실행 가능
+cube-simulator = "cube_simulator.__main__:main"
+cube-sim = "cube_simulator.__main__:main"
+
+[project.urls]
+Repository = "https://github.com/StealthBlack66/pick_stack"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cube_simulator*"]
+exclude = ["__pycache__*", "*.pyc"]
+
+[tool.setuptools.package-data]
+cube_simulator = ["py.typed"]

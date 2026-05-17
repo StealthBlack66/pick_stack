@@ -1,0 +1,15 @@
+# 큐브 시뮬레이터 — 디자인 + 시뮬 only (다른 컴퓨터 최소 설치)
+#
+# 이 의존성만 설치하면:
+#   ✓ 3D 큐브 배치 디자인 (드래그·프리셋·JSON)
+#   ✓ 모션 계획 표 편집
+#   ✓ 가상 그리퍼 시뮬레이션 (dry-run)
+#   ✗ 실 로봇 동작 (별도 설치 필요 — requirements-robot.txt + ROS2)
+#   ✗ 비전 검출 (별도 — requirements-vision.txt)
+#
+# 설치:
+#   pip install -r requirements-sim.txt
+PyQt5>=5.15
+PyOpenGL>=3.1.0
+PyOpenGL_accelerate>=3.1.0  # 선택 — 렌더링 성능 향상 (실패해도 무방)
+numpy>=1.21

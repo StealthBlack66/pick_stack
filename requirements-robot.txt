@@ -1,0 +1,13 @@
+# 실 로봇 모드 의존성 — 두산 ROS2 + 비전 통합 실행 시 필요
+#
+# 설치 (Python 패키지만):
+#   pip install -r requirements-sim.txt -r requirements-robot.txt
+#
+# ⚠ ROS2 측 의존성은 Python pip 으로 설치 불가능. 별도로:
+#   1) ROS2 Humble 시스템 설치 — https://docs.ros.org/en/humble/Installation.html
+#   2) Doosan ROS2 패키지 빌드 — https://github.com/DoosanRobotics/doosan-robot2
+#   3) doosan_ws 빌드 후 source ~/doosan_ws/install/setup.bash
+#
+# rclpy / sensor_msgs / dsr_msgs2 등은 위 ROS2 환경에서 자동으로 사용 가능.
+-r requirements-vision.txt
+python-dotenv>=1.0

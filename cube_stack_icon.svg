@@ -1,0 +1,102 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- ===== 배경 ===== -->
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#1e293b"/>
+      <stop offset="100%" stop-color="#0f172a"/>
+    </linearGradient>
+
+    <!-- 큐브 1 (top - rose/pink) -->
+    <linearGradient id="c1top" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#fda4af"/>
+      <stop offset="100%" stop-color="#f87171"/>
+    </linearGradient>
+    <linearGradient id="c1l" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#f43f5e"/>
+      <stop offset="100%" stop-color="#be123c"/>
+    </linearGradient>
+    <linearGradient id="c1r" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#e11d48"/>
+      <stop offset="100%" stop-color="#881337"/>
+    </linearGradient>
+
+    <!-- 큐브 2 (middle - amber/gold) -->
+    <linearGradient id="c2top" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#fef3c7"/>
+      <stop offset="100%" stop-color="#fcd34d"/>
+    </linearGradient>
+    <linearGradient id="c2l" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#f59e0b"/>
+      <stop offset="100%" stop-color="#b45309"/>
+    </linearGradient>
+    <linearGradient id="c2r" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#d97706"/>
+      <stop offset="100%" stop-color="#78350f"/>
+    </linearGradient>
+
+    <!-- 큐브 3 (bottom - teal/cyan) -->
+    <linearGradient id="c3top" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#a5f3fc"/>
+      <stop offset="100%" stop-color="#5eead4"/>
+    </linearGradient>
+    <linearGradient id="c3l" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#14b8a6"/>
+      <stop offset="100%" stop-color="#0f766e"/>
+    </linearGradient>
+    <linearGradient id="c3r" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#0d9488"/>
+      <stop offset="100%" stop-color="#134e4a"/>
+    </linearGradient>
+
+    <!-- 그리퍼 (steel) -->
+    <linearGradient id="grip" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#cbd5e1"/>
+      <stop offset="100%" stop-color="#64748b"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 배경 둥근 사각형 -->
+  <rect x="8" y="8" width="240" height="240" rx="44" ry="44"
+        fill="url(#bg)" stroke="#334155" stroke-width="3"/>
+
+  <!-- ===== 그리퍼 힌트 (상단, top cube 위에 떠 있음) ===== -->
+  <g opacity="0.85">
+    <!-- shaft -->
+    <rect x="120" y="14" width="16" height="22" rx="3" fill="url(#grip)" stroke="#334155" stroke-width="1.5"/>
+    <!-- horizontal mount -->
+    <rect x="98" y="32" width="60" height="8" rx="2" fill="url(#grip)" stroke="#334155" stroke-width="1.5"/>
+    <!-- left finger -->
+    <rect x="92" y="38" width="6" height="20" rx="1" fill="url(#grip)" stroke="#334155" stroke-width="1.5"/>
+    <!-- right finger -->
+    <rect x="158" y="38" width="6" height="20" rx="1" fill="url(#grip)" stroke="#334155" stroke-width="1.5"/>
+  </g>
+
+  <!-- ===== 3 stacked cubes (isometric) ===== -->
+  <!-- 큐브 파라미터: half-diamond-w=28, half-diamond-h=16, edge=24 -->
+  <!-- top vertices: (0,-16), (28,0), (0,16), (-28,0)  side faces extend down by 24 -->
+  <!-- 중심 (128,84) → vertex y=68, side bottom y=124 (top cube) -->
+
+  <!-- TOP CUBE (rose) center (128,80) -->
+  <g transform="translate(128 80)">
+    <polygon points="0,-16 28,0 0,16 -28,0" fill="url(#c1top)" stroke="#881337" stroke-width="1.5"/>
+    <polygon points="-28,0 0,16 0,40 -28,24" fill="url(#c1l)" stroke="#881337" stroke-width="1.5"/>
+    <polygon points="28,0 0,16 0,40 28,24" fill="url(#c1r)" stroke="#881337" stroke-width="1.5"/>
+  </g>
+
+  <!-- MIDDLE CUBE (amber) center (128,136) — top vertex at y=120 = top cube bottom 120 -->
+  <g transform="translate(128 136)">
+    <polygon points="0,-16 28,0 0,16 -28,0" fill="url(#c2top)" stroke="#78350f" stroke-width="1.5"/>
+    <polygon points="-28,0 0,16 0,40 -28,24" fill="url(#c2l)" stroke="#78350f" stroke-width="1.5"/>
+    <polygon points="28,0 0,16 0,40 28,24" fill="url(#c2r)" stroke="#78350f" stroke-width="1.5"/>
+  </g>
+
+  <!-- BOTTOM CUBE (teal) center (128,192) — top vertex at y=176 = middle bottom 176 -->
+  <g transform="translate(128 192)">
+    <polygon points="0,-16 28,0 0,16 -28,0" fill="url(#c3top)" stroke="#134e4a" stroke-width="1.5"/>
+    <polygon points="-28,0 0,16 0,40 -28,24" fill="url(#c3l)" stroke="#134e4a" stroke-width="1.5"/>
+    <polygon points="28,0 0,16 0,40 28,24" fill="url(#c3r)" stroke="#134e4a" stroke-width="1.5"/>
+  </g>
+
+  <!-- ===== 베이스 그림자 (밑) ===== -->
+  <ellipse cx="128" cy="234" rx="62" ry="6" fill="#000" opacity="0.35"/>
+</svg>

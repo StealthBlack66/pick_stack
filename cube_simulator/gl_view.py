@@ -73,6 +73,10 @@ class Cube3DView(QOpenGLWidget):
         self._drag_cube: PlacedCube | None = None
         self._source_cubes: list[PlacedCube] = []
         self._source_offset_x = -8.0
+        # 정렬 후 실제 mm 좌표 그대로 source 큐브 표시 (set_source_positions_mm)
+        self._source_positions_mm: list[tuple[float, float, float]] = []
+        # 정렬에 사용한 그리드 영역 (center_xy, spacing, rows, cols)
+        self._align_grid: tuple[tuple[float, float], float, int, int] | None = None
 
         # 로봇 시뮬레이션 (가상 그리퍼)
         self._gripper_pose: tuple[float, float, float, float] | None = None
@@ -82,6 +86,10 @@ class Cube3DView(QOpenGLWidget):
         # 잡혀서 그리퍼 따라 움직이는 큐브 시각 (cx, cy, cz, yaw_deg)
         self._hidden_cube_keys: set = set()  # 시뮬 중 모델에서 일시 hide
         self._sim_status_text: str = ''       # 시뮬 진행 상태 화면 표시
+        self._collision_state: bool = False   # 실시간 충돌 시 그리퍼 빨강
+        # 충돌 컴포넌트 — 'none'|'gripper'|'held'|'both'
+        # 'held' / 'both' 일 때 held cube 도 빨간 외곽선
+        self._collision_kind: str = 'none'
 
     # --- 외부 API -------------------------------------------------------------
     def set_model(self, model: CubeModel) -> None:
@@ -114,6 +122,40 @@ class Cube3DView(QOpenGLWidget):
         self._source_cubes = cubes
         self.update()
 
+    def set_source_positions_mm(self,
+                                positions: list[tuple[float, float, float]]) -> None:
+        """정렬된 큐브의 실제 mm 좌표 그대로 source 로 표시."""
+        self._source_positions_mm = list(positions)
+        self.update()
+
+    def set_align_grid(self,
+                       center: tuple[float, float] | None,
+                       spacing: float | None,
+                       rows: int | None,
+                       cols: int | None) -> None:
+        """정렬에 사용한 그리드 영역을 화면 바닥에 표시.
+
+        center=None / spacing=None 이면 영역 표시 해제.
+        rows, cols 둘 다 None 이면 spacing 만 알고 정사각형(5×5) 가정.
+        """
+        if center is None or spacing is None:
+            self._align_grid = None
+        else:
+            r = int(rows) if rows is not None else 5
+            c = int(cols) if cols is not None else 5
+            self._align_grid = (center, float(spacing), r, c)
+        # 정렬 그리드를 카메라가 한눈에 보이도록 살짝 줌아웃 + 중심 이동
+        if self._align_grid is not None:
+            (cx, cy), sp, r_, c_ = self._align_grid
+            extent = max(r_, c_) * sp
+            base_x, base_y = self._model.base_xy
+            mid_x = (cx + base_x) / 2.0
+            mid_y = (cy + base_y) / 2.0
+            self._cam_target = np.array([mid_x, mid_y, 50.0], dtype=np.float64)
+            target_dist = max(extent * 2.4, 500.0)
+            self._cam_distance = max(self._cam_distance, target_dist)
+        self.update()
+
     def set_gripper_pose(self,
                         pose: tuple[float, float, float, float] | None,
                         open_mm: float = 35.0) -> None:
@@ -134,6 +176,18 @@ class Cube3DView(QOpenGLWidget):
         self._sim_status_text = text
         # 상태 텍스트는 GL에 직접 안 그림; main_window 상태바가 이미 표시.
         # 이 값은 outside polling 용.
+
+    def set_collision_state(self, active: bool, kind: str = 'gripper') -> None:
+        """실시간 충돌 상태.
+
+        active=True 면 kind 에 따라 그리퍼/held cube 를 빨강 강조.
+        kind: 'gripper'(default) | 'held' | 'both' | 'none'.
+        """
+        new_kind = kind if active else 'none'
+        if self._collision_state != active or self._collision_kind != new_kind:
+            self._collision_state = active
+            self._collision_kind = new_kind
+            self.update()
 
     def top_view(self) -> None:
         self._cam_yaw_deg = 0.0
@@ -190,8 +244,21 @@ class Cube3DView(QOpenGLWidget):
         if self._snap_half:
             self._draw_half_grid()
 
-        # source 큐브 (왼쪽 영역, 회색)
-        if self._source_cubes:
+        # 정렬 그리드 영역 (테이블 + 라인) — 일반 그리드 위에 같이 그림
+        self._draw_align_grid_area()
+
+        # source 큐브 — 실제 mm 좌표 (set_source_positions_mm) 우선,
+        # 없으면 기존 set_source_cubes 의 fake 위치 사용
+        if self._source_positions_mm:
+            # 시각화 좌표계는 z_table_top=0 기준이지만 15번이 캡처한 sample_z 는
+            # 두산 로봇 base 프레임 mm 라 좌표계가 달라 그대로 박으면 underground.
+            # 정렬된 큐브는 항상 layer 0 (테이블 위 1층) 으로 시각화 통일.
+            cube_top_z = self._z_table_top + self._model.cube_width_mm * 0.5
+            for (sx, sy, _sz) in self._source_positions_mm:
+                glp.draw_cube(sx, sy, cube_top_z,
+                              size=self._model.cube_width_mm, yaw_deg=0.0,
+                              color=styles.SOURCE_COLOR)
+        elif self._source_cubes:
             src_origin_x = (
                 self._model.base_xy[0] + self._source_offset_x * self._model.pitch_mm
             )
@@ -212,7 +279,8 @@ class Cube3DView(QOpenGLWidget):
                 continue  # 드래그 중 — 별도 위치로
             x = self._model.base_xy[0] + c.gx * self._model.pitch_mm
             y = self._model.base_xy[1] + c.gy * self._model.pitch_mm
-            z = self._z_table_top + self._model.cube_width_mm * (c.layer + 0.5)
+            from .motion_plan import cube_center_z as _ccz
+            z = _ccz(c.layer, self._model.cube_width_mm, self._z_table_top)
             if i == self._active_index:
                 color = styles.ACTIVE_COLOR
             elif self._model.is_floating(c):
@@ -233,10 +301,22 @@ class Cube3DView(QOpenGLWidget):
         # 잡힌 큐브 (시뮬레이션)
         if self._held_cube_view is not None:
             hx, hy, hz, hyaw = self._held_cube_view
+            held_collide = (self._collision_state
+                            and self._collision_kind in ('held', 'both'))
+            held_color = ((1.0, 0.30, 0.30) if held_collide
+                          else styles.ACTIVE_COLOR)
             glp.draw_cube(hx, hy, hz,
                           size=self._model.cube_width_mm,
                           yaw_deg=hyaw - 90.0,
-                          color=styles.ACTIVE_COLOR)
+                          color=held_color)
+            if held_collide:
+                # 빨간 외곽선 강조 — 사용자 시각 인지 강화
+                glp.draw_cube_outline(
+                    hx, hy, hz,
+                    size=self._model.cube_width_mm * 1.04,
+                    yaw_deg=hyaw - 90.0,
+                    color=(0.95, 0.10, 0.10), line_width=3.0,
+                )
 
         # 드래그 중 큐브 (반투명 호버 위치)
         if self._drag_cube is not None:
@@ -256,14 +336,25 @@ class Cube3DView(QOpenGLWidget):
         elif self._hover_pick is not None and not self._is_button_down():
             self._draw_hover_ghost()
 
-        # 그리퍼
+        # 그리퍼 — 충돌 컴포넌트가 gripper/both 일 때만 finger·body 빨강 강조
         if self._gripper_pose is not None:
             gx, gy, gz, gyaw = self._gripper_pose
-            glp.draw_gripper(
-                gx, gy, gz,
-                yaw_deg=gyaw,
-                open_mm=self._gripper_open_mm,
-            )
+            gripper_collide = (self._collision_state
+                               and self._collision_kind in ('gripper', 'both'))
+            if gripper_collide:
+                glp.draw_gripper(
+                    gx, gy, gz,
+                    yaw_deg=gyaw,
+                    open_mm=self._gripper_open_mm,
+                    body_color=(1.0, 0.30, 0.30),
+                    finger_color=(0.95, 0.10, 0.10),
+                )
+            else:
+                glp.draw_gripper(
+                    gx, gy, gz,
+                    yaw_deg=gyaw,
+                    open_mm=self._gripper_open_mm,
+                )
 
     # --- 마우스/휠 ------------------------------------------------------------
     def _is_button_down(self) -> bool:
@@ -513,6 +604,58 @@ class Cube3DView(QOpenGLWidget):
                                         yaw_deg=0.0,
                                         color=styles.GHOST_ADD_COLOR, alpha=0.40)
                     return
+
+    def _draw_align_grid_area(self) -> None:
+        """정렬에 사용한 그리드 영역 (테이블 면 + 라인) — 직사각형 지원."""
+        if self._align_grid is None:
+            return
+        from OpenGL import GL
+        (cx, cy), sp, rows, cols = self._align_grid
+        z_floor = self._z_table_top - 0.3
+        z_lines = self._z_table_top + 0.12
+        half_w = (cols * sp) / 2.0
+        half_h = (rows * sp) / 2.0
+        pad = sp * 0.5
+        x_min = cx - half_w - pad
+        x_max = cx + half_w + pad
+        y_min = cy - half_h - pad
+        y_max = cy + half_h + pad
+        # 테이블 면 (살짝 다른 색)
+        GL.glColor3f(0.18, 0.24, 0.30)
+        GL.glBegin(GL.GL_QUADS)
+        GL.glVertex3f(x_min, y_min, z_floor); GL.glVertex3f(x_max, y_min, z_floor)
+        GL.glVertex3f(x_max, y_max, z_floor); GL.glVertex3f(x_min, y_max, z_floor)
+        GL.glEnd()
+        # 그리드 라인 (cell 경계)
+        GL.glColor3f(0.55, 0.70, 0.85)
+        GL.glLineWidth(1.5)
+        GL.glBegin(GL.GL_LINES)
+        for i in range(cols + 1):
+            x = cx - half_w + i * sp
+            GL.glVertex3f(x, cy - half_h, z_lines)
+            GL.glVertex3f(x, cy + half_h, z_lines)
+        for j in range(rows + 1):
+            y = cy - half_h + j * sp
+            GL.glVertex3f(cx - half_w, y, z_lines)
+            GL.glVertex3f(cx + half_w, y, z_lines)
+        GL.glEnd()
+        # 셀 중심에 작은 십자 (각 셀 좌표 표시)
+        GL.glColor3f(0.40, 0.55, 0.70)
+        GL.glLineWidth(1.0)
+        GL.glBegin(GL.GL_LINES)
+        tick = sp * 0.12
+        x0 = cx - half_w + sp * 0.5
+        y0 = cy - half_h + sp * 0.5
+        for r in range(rows):
+            for c in range(cols):
+                cxk = x0 + c * sp
+                cyk = y0 + r * sp
+                GL.glVertex3f(cxk - tick, cyk, z_lines)
+                GL.glVertex3f(cxk + tick, cyk, z_lines)
+                GL.glVertex3f(cxk, cyk - tick, z_lines)
+                GL.glVertex3f(cxk, cyk + tick, z_lines)
+        GL.glEnd()
+        GL.glLineWidth(1.0)
 
     def _draw_half_grid(self) -> None:
         """0.5 스냅 모드에서 valley 위치를 알려주는 보조 라인."""

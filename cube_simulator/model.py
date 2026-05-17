@@ -186,6 +186,43 @@ class CubeModel:
             src.yaw_deg = tgt_yaw
         return src
 
+    def move_cube(self,
+                  src: PlacedCube,
+                  new_gx: float,
+                  new_gy: float,
+                  new_layer: Optional[int] = None,
+                  max_layer: int = 15) -> Optional[int]:
+        """기존 큐브를 새 위치로 이동. 충돌 검사 + 정렬 캡슐화.
+
+        new_layer=None 이면 (new_gx, new_gy) 의 자동 적층 layer 를 찾음.
+        성공 시 확정된 layer 반환, 충돌·범위 초과면 None 반환 (원위치 유지).
+        """
+        if src not in self.cubes:
+            return None
+        self.cubes.remove(src)
+        try:
+            if new_layer is None:
+                chosen = None
+                for ly in range(0, max_layer + 1):
+                    if not self.would_collide(new_gx, new_gy, ly):
+                        chosen = ly
+                        break
+                if chosen is None:
+                    return None
+            else:
+                if self.would_collide(new_gx, new_gy, new_layer):
+                    return None
+                chosen = new_layer
+            src.gx = new_gx
+            src.gy = new_gy
+            src.layer = chosen
+            self.cubes.append(src)
+            return chosen
+        finally:
+            if src not in self.cubes:
+                self.cubes.append(src)
+            self._sort()
+
     def remove_top_at(self, gx: float, gy: float) -> Optional[PlacedCube]:
         top = -1
         idx = -1
