@@ -35,6 +35,11 @@ class SimulatorController(QObject):
     plan_changed = pyqtSignal(object)  # list[PlanItem]
     align_finished = pyqtSignal(bool, object)  # ok, dets
     collision_decision_needed = pyqtSignal(int, str)  # cube_idx, message
+    # LLM 응답 (raw_text, reasoning) — GUI 의 응답 영역 표시용
+    llm_response = pyqtSignal(str, str)
+    # LLM 액션 실행 시작/끝 (UI 잠금용)
+    llm_started = pyqtSignal()
+    llm_finished = pyqtSignal()
 
     def __init__(self, model: CubeModel, view: Cube3DView, parent=None):
         super().__init__(parent)
@@ -42,6 +47,7 @@ class SimulatorController(QObject):
         self._view = view
         self._worker: Optional[RobotWorker] = None
         self._sim: Optional[SimAnimator] = None
+        self._llm_worker = None
         self._tool_mode = 'add'
         self._next_yaw_deg = 90.0
         self._dets_cache: Optional[list[dict]] = None
@@ -490,6 +496,170 @@ class SimulatorController(QObject):
 
         self.status.emit('시뮬 리셋 완료')
         self.log.emit('=== 시뮬레이터 시각 상태 리셋 ===')
+
+    # ============================================================
+    # LLM 자연어 인터페이스 (Mode A/B/C/D)
+    # ============================================================
+    def start_llm_command(self,
+                          mode: str,
+                          user_text: str,
+                          image_bytes=None,
+                          image_mime: str = 'image/png') -> bool:
+        """LLM 백그라운드 worker 시작. mode = 'A' | 'B' | 'C' | 'D'.
+
+        worker.finished_ok → _on_llm_response → dispatch.
+        worker.failed → error.emit.
+        """
+        from .llm import AnthropicClient, LlmRequest, LlmWorker
+
+        if self._llm_worker is not None and self._llm_worker.isRunning():
+            self.error.emit('이미 LLM 작업 중')
+            return False
+
+        client = AnthropicClient()
+        if not client.has_api_key:
+            self.error.emit(
+                'ANTHROPIC_API_KEY 미설정. .env 또는 셸 env 에 키 추가 후 재시작.'
+            )
+            return False
+
+        req = LlmRequest(
+            mode=mode,
+            user_text=user_text,
+            image_bytes=image_bytes,
+            image_mime=image_mime,
+            model_snapshot=self._model.to_dict(),
+            dets=self._dets_cache,
+            plan_summary=self._plan_summary_for_llm(),
+        )
+        worker = LlmWorker(req, client=client, parent=self)
+        worker.finished_ok.connect(self._on_llm_response)
+        worker.failed.connect(self._on_llm_failed)
+        worker.finished.connect(self._on_llm_thread_finished)
+        self._llm_worker = worker
+        self.llm_started.emit()
+        self.status.emit(f'🤖 LLM (mode {mode}) 요청 전송...')
+        worker.start()
+        return True
+
+    def _plan_summary_for_llm(self) -> str:
+        """plan 요약 한 줄 — LLM 컨텍스트용."""
+        n = len(self._plan)
+        if n == 0:
+            return 'plan 비어있음 (rebuild_plan 으로 생성 필요)'
+        dirty = ' (dirty — 모델 변경 후 rebuild 권장)' if self._plan_dirty else ''
+        return f'plan {n} 단계{dirty}'
+
+    def _on_llm_response(self, raw_text: str, cmd, _raw_reasoning: str) -> None:
+        """LLM 응답 도착 — 응답 emit + 액션 dispatch.
+
+        worker 가 보낸 _raw_reasoning 은 LLM 응답 전체 텍스트 (디버그용). 우리는
+        cmd.reasoning (LLM 이 JSON 안에 넣은 짧은 한 줄) 만 사용자에게 표시.
+        """
+        short = (cmd.reasoning or '').strip() or '(reasoning 없음)'
+        self.log.emit(f'🤖 LLM [{cmd.action}]: {short}')
+        self.llm_response.emit(raw_text, short)
+        self._dispatch_llm_command(cmd, depth=0)
+
+    def _on_llm_failed(self, msg: str) -> None:
+        self.error.emit(f'🤖 LLM 실패: {msg}')
+        self.llm_response.emit('', f'❌ {msg}')
+
+    def _on_llm_thread_finished(self) -> None:
+        self._llm_worker = None
+        self.llm_finished.emit()
+
+    # 액션 → 메서드 매핑. 안전상 화이트리스트로 dispatch.
+    def _dispatch_llm_command(self, cmd, depth: int = 0) -> None:
+        """LLM 명령 실행. next_action 체인은 최대 3 깊이까지."""
+        if cmd is None or not cmd.is_valid():
+            return
+        if depth > 3:
+            self.log.emit('🤖 LLM 체인 깊이 초과 — 추가 액션 무시')
+            return
+
+        action = cmd.action
+        args = dict(cmd.args or {})
+
+        try:
+            if action == 'load_preset':
+                name = args.get('name', '')
+                if name:
+                    self.load_preset(str(name))
+            elif action == 'add_cube':
+                gx = float(args.get('gx', 0.0))
+                gy = float(args.get('gy', 0.0))
+                yaw = float(args.get('yaw', self._next_yaw_deg))
+                c = self._model.add_auto_layer(gx, gy, yaw_deg=yaw)
+                self._view.update()
+                self.model_changed.emit()
+                if c is None:
+                    self.status.emit(f'🤖 add_cube ({gx:+.1f},{gy:+.1f}) 충돌')
+            elif action == 'remove_cube':
+                gx = float(args.get('gx', 0.0))
+                gy = float(args.get('gy', 0.0))
+                layer = int(args.get('layer', 0))
+                self._model.remove(gx, gy, layer)
+                self._view.update()
+                self.model_changed.emit()
+            elif action == 'move_cube':
+                src = args.get('from') or {}
+                dst = args.get('to') or {}
+                cube = self._model.find(
+                    float(src.get('gx', 0.0)),
+                    float(src.get('gy', 0.0)),
+                    int(src.get('layer', 0)),
+                )
+                if cube is not None:
+                    self._model.move_cube(cube,
+                                          float(dst.get('gx', 0.0)),
+                                          float(dst.get('gy', 0.0)))
+                    self._view.update()
+                    self.model_changed.emit()
+            elif action == 'clear_model':
+                self.clear_model()
+            elif action == 'update_cube_yaw':
+                gx = float(args.get('gx', 0.0))
+                gy = float(args.get('gy', 0.0))
+                layer = int(args.get('layer', 0))
+                yaw = float(args.get('yaw', 90.0))
+                self._model.update_cube(gx, gy, layer, new_yaw=yaw)
+                self._view.update()
+                self.model_changed.emit()
+            elif action == 'rebuild_plan':
+                self.rebuild_plan()
+            elif action == 'apply_yaw_corrections':
+                self.apply_yaw_corrections()
+            elif action == 'start_simulation':
+                auto = bool(args.get('auto_correct', True))
+                self.start_simulation(auto_correct=auto)
+            elif action == 'start_alignment':
+                dry = bool(args.get('dry_run', True))
+                quick = bool(args.get('quick', True))
+                self.start_alignment(dry_run=dry, quick=quick)
+            elif action == 'start_run':
+                dry = bool(args.get('dry_run', True))
+                self.start_run(dry_run=dry)
+            elif action == 'start_oneshot_calibration':
+                skip = bool(args.get('skip_launch', False))
+                keep = bool(args.get('keep_bringup', True))
+                self.start_oneshot_calibration(skip_launch=skip, keep_bringup=keep)
+            elif action == 'start_recover_home':
+                dry = bool(args.get('dry_run', False))
+                self.start_recover_home(dry_run=dry)
+            elif action == 'reset_simulator':
+                reset_model = bool(args.get('reset_model', False))
+                self.reset_simulator(reset_model=reset_model)
+            elif action in ('explain', 'noop'):
+                pass   # 응답만 (reasoning 은 이미 emit 됨)
+            else:
+                self.log.emit(f'🤖 미허용 action: {action}')
+        except Exception as e:  # noqa: BLE001
+            self.error.emit(f'🤖 액션 {action} 실행 실패: {e!r}')
+
+        # 체인 다음 액션
+        if cmd.next_action is not None:
+            self._dispatch_llm_command(cmd.next_action, depth=depth + 1)
 
     def request_estop(self) -> None:
         """비상정지 — bringup/DRCF 프로세스 통째 kill = "터미널 끈 효과".

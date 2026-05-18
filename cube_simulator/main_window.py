@@ -38,6 +38,7 @@ from .controller import SimulatorController
 from .gl_view import Cube3DView
 from .model import CubeModel
 from .widgets import (
+    LlmPanel,
     PlanTablePanel,
     PreparePanel,
     RunControlPanel,
@@ -214,6 +215,10 @@ class CubeSimulatorMainWindow(QMainWindow):
         # 시작 신호는 main_window 가 통합 처리 (다른 컬럼의 패널도 같이 잠금).
         # 양쪽 패널이 모두 만들어진 후 _wire_signals 에서 connect.
         v.addWidget(self._prepare_panel)
+
+        # 🤖 LLM 자연어 인터페이스 — 디자인 컬럼 맨 아래
+        self._llm_panel = LlmPanel(self._controller)
+        v.addWidget(self._llm_panel)
 
         v.addStretch(1)  # 위쪽 컴팩트 — 아래 빈공간
         return w

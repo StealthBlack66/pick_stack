@@ -92,6 +92,7 @@ EOF
         cp doosan_config.py "$STAGE/"
         cp requirements-vision.txt "$STAGE/"
         cp requirements-robot.txt "$STAGE/"
+        cp requirements-llm.txt "$STAGE/" 2>/dev/null || true
         cp PORTABILITY.md "$STAGE/" 2>/dev/null || true
         cp RECOVERY.md "$STAGE/" 2>/dev/null || true
         cp aruco_DICT_6X6_50_ID0_50mm.png "$STAGE/" 2>/dev/null || true

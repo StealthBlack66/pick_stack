@@ -1,0 +1,22 @@
+# LLM 통합 의존성 — Anthropic Claude API 기반 자연어 인터페이스
+#
+# 설치:
+#   pip install --user -r requirements-llm.txt
+#
+# 환경변수:
+#   ANTHROPIC_API_KEY=sk-ant-...     # https://console.anthropic.com/ 에서 발급
+#
+# (선택) .env 파일에 키 저장하면 자동 로드:
+#   cp .env.example .env
+#   $EDITOR .env  # ANTHROPIC_API_KEY 채우기
+anthropic>=0.30
+python-dotenv>=1.0
+# anthropic 의존성 — user-site 분리 환경에서 명시 (시스템 dist-packages fallback 안 됨)
+distro>=1.9
+
+# === Mode D 음성 입력 (선택) ===
+# 🎤 마이크 녹음 → Google Web Speech API STT → Mode A 흐름.
+# 시스템 의존성: ALSA `arecord` (apt install alsa-utils — 우분투 표준 포함).
+# 인터넷 필요 (Google Web Speech 무료 API). 한국어 OK.
+SpeechRecognition>=3.10
+
