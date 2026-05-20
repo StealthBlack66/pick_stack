@@ -22,6 +22,7 @@ import importlib.util
 import math
 import os
 import sys
+import time
 from pathlib import Path
 
 import cv2
@@ -84,6 +85,9 @@ CUBE_WIDTH_MM = 25.0
 PRE_OPEN_WIDTH_MM = 40.0
 RELEASE_WIDTH_MM = 27.0
 GRIP_RANGE_MM = 130.0    # RH-P12-RN-A 완전 열림(POS 0)에서 약 130mm 추정
+# 대각 잡기 (45°/135° yaw — cube 코너에 finger 가 닿음) 시 pre-open 폭.
+# cube 대각 = 25 × √2 ≈ 35.4mm. finger 가 cube 옆에 안 닿게 마진 포함해서 50mm.
+DIAG_PRE_OPEN_WIDTH_MM = 50.0
 
 # 0° snap 보정 — 학습 라벨이 axis-aligned 라 검출 yaw 가 0° 부근으로 collapse 함.
 # 실제 흩뿌려진 cube 는 거의 0° 가 아니므로, 검출이 0° 근처면 작은 회전 부여.
@@ -94,11 +98,13 @@ YAW_NEAR_ZERO_BIAS_DEG = 15.0    # 위 경우에 사용할 회전량 (부호는 
 # 모션
 Z_APPROACH = 80.0
 Z_LIFT = 100.0
+
 # 한 segment 이동 시간 (12번 default 5.0 → 단축). 너무 짧으면 trajectory PATH_TOL 실패
-# 2.0 에서 status=6 (ABORTED) 발생 → 3.0 으로 늘려서 controller 가 따라잡을 시간 확보
-MOVE_DURATION_SEC = 5.0
-# 그리퍼 settle (close/open 후 모터 멈출 때까지 대기, 12번 default 1.0)
-GRIPPER_SETTLE_SEC = 0.4
+# goal_time_tolerance=2s + retry + operation_speed=100 + velocity hint 위에서 1.5 까지
+# 단축. status=6 path tolerance abort 자주면 2.0 / 2.5 / 3.0 순으로 복원.
+MOVE_DURATION_SEC = 1.5
+# 그리퍼 settle — RH-P12-RN-A 작은 변화는 0.2s 면 충분.
+GRIPPER_SETTLE_SEC = 0.2
 
 
 def width_mm_to_pos(width_mm: float) -> int:
@@ -373,7 +379,136 @@ class CubeDetector:
             
         return float(yaw)
 
+    def _compute_top_face_center_and_yaw(self, color, depth_frame, bbox):
+        """
+        YOLO bounding box 안에서 깊이(Depth)를 이용해 큐브의 '순수 상단면'만 분리하고,
+        해당 마스크를 RGB 이미지에 덮어씌워 선명한 엣지로 회전각(yaw)을 구합니다.
+        (현재 모델이 윗면/옆면을 구분하지 못할 때 윗면만 정확히 분리하는 강력한 로직)
+        """
+        x1, y1, x2, y2 = bbox
+        arr = np.asanyarray(depth_frame.get_data())
+        H, W = arr.shape
+        x1 = max(0, int(x1)); y1 = max(0, int(y1))
+        x2 = min(W, int(x2)); y2 = min(H, int(y2))
+        if x2 - x1 < 5 or y2 - y1 < 5: return None
+        
+        crop = arr[y1:y2, x1:x2].astype(np.float32) * 0.001
+        valid = crop[crop > 0.05]
+        if valid.size < 30: return None
+        z_top_m = float(np.percentile(valid, 5))
+
+        # 사용자 요청에 따라 깊이 허용 오차를 ±12mm로 설정함 (z_top_m 기준 ±0.012)
+        mask_local = ((crop >= z_top_m - 0.012) & (crop <= z_top_m + 0.012)).astype(np.uint8) * 255
+        
+        k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        mask_local = cv2.morphologyEx(mask_local, cv2.MORPH_OPEN, k)
+        mask_local = cv2.morphologyEx(mask_local, cv2.MORPH_CLOSE, k)
+        
+        # 윗면 가장자리에서 옆면으로 꺾이는 경계선 노이즈를 깎아냄 (아래쪽 쏠림 방지)
+        k_erode = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        mask_local = cv2.erode(mask_local, k_erode, iterations=1)
+        
+        ys_local, xs_local = np.where(mask_local > 0)
+        if len(ys_local) < 20: return None
+
+        # 사용자 요청에 따라 깊이 임계값을 12mm(0.012)로 완화
+        # (단, 위쪽에서 mask_local을 12mm로 재정의함)
+        
+        base_pts = []
+        for v_loc, u_loc in zip(ys_local, xs_local):
+            u = int(u_loc + x1)
+            v = int(v_loc + y1)
+            d = float(arr[v, u]) * 0.001
+            if d < 0.05: continue
+            cam = rs.rs2_deproject_pixel_to_point(self.intr, [float(u), float(v)], d)
+            cam_h = np.array([cam[0], cam[1], cam[2], 1.0])
+            bp = (self.T_cam2base @ cam_h)[:3] * 1000.0
+            base_pts.append(bp)
+            
+        if len(base_pts) < 20: return None
+        base_pts = np.array(base_pts, dtype=np.float32)
+        
+        # RealSense 카메라의 고질적인 시차(Parallax) 및 Depth 그림자 현상으로 인해
+        # 깊이 마스크가 실제 시각적 윗면보다 항상 '아래쪽(+V 방향)'으로 치우치는 현상 보정
+        
+        # 1. 일단 2D 이미지 상에서의 무게중심 픽셀(u, v)을 구함
+        u_mean = int(np.mean(xs_local) + x1)
+        v_mean = int(np.mean(ys_local) + y1)
+        
+        # 2. 사용자 요청에 따라 위로 5픽셀만 끌어올림 (-5)
+        v_corrected = max(0, v_mean - 5)
+        
+        # 3. 보정된 2D 픽셀을 다시 3D 공간(Base 좌표계)으로 역투영하여 완벽한 3D 센터 확보
+        d_center = float(arr[v_corrected, u_mean]) * 0.001
+        if d_center < 0.05: 
+            d_center = z_top_m  # 안전장치
+            
+        cam_center = rs.rs2_deproject_pixel_to_point(self.intr, [float(u_mean), float(v_corrected)], d_center)
+        cam_center_h = np.array([cam_center[0], cam_center[1], cam_center[2], 1.0])
+        base_center = (self.T_cam2base @ cam_center_h)[:3] * 1000.0
+        
+        cx, cy, cz = float(base_center[0]), float(base_center[1]), float(base_center[2])
+
+        color_crop = color[y1:y2, x1:x2]
+        gray = cv2.cvtColor(color_crop, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        edges = cv2.Canny(gray, 30, 100)
+        
+        k7 = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+        mask_dilated = cv2.dilate(mask_local, k7)
+        edges = cv2.bitwise_and(edges, edges, mask=mask_dilated)
+        
+        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=10, minLineLength=5, maxLineGap=5)
+        
+        yaw_deg = None
+        if lines is not None and len(lines) >= 1:
+            f = 4.0
+            sin_sum, cos_sum, n = 0.0, 0.0, 0
+            for x_1, y_1, x_2, y_2 in lines.reshape(-1, 4):
+                if x_1 == x_2 and y_1 == y_2: continue
+                a = math.atan2(y_2 - y_1, x_2 - x_1)
+                sin_sum += math.sin(a * f)
+                cos_sum += math.cos(a * f)
+                n += 1
+            if n > 0:
+                yaw_img = math.degrees(math.atan2(sin_sum, cos_sum)) / f
+                while yaw_img > 45.0: yaw_img -= 90.0
+                while yaw_img <= -45.0: yaw_img += 90.0
+                
+                cu = (x1 + x2) / 2.0
+                cv_ = (y1 + y2) / 2.0
+                half_px = 15.0
+                rad = math.radians(yaw_img)
+                cs, sn = math.cos(rad), math.sin(rad)
+                local = np.array([[-half_px, -half_px], [half_px, -half_px],
+                                  [half_px, half_px], [-half_px, half_px]], dtype=np.float32)
+                R = np.array([[cs, -sn], [sn, cs]], dtype=np.float32)
+                box_px = (local @ R.T) + np.array([cu, cv_], dtype=np.float32)
+                
+                bp_virtual = []
+                for pt in box_px:
+                    c = rs.rs2_deproject_pixel_to_point(self.intr, [float(pt[0]), float(pt[1])], z_top_m)
+                    ch = np.array([c[0], c[1], c[2], 1.0])
+                    b = (self.T_cam2base @ ch)[:3] * 1000.0
+                    bp_virtual.append([b[0], b[1]])
+                
+                bp_virtual = np.array(bp_virtual, dtype=np.float32)
+                rect_virtual = cv2.minAreaRect(bp_virtual)
+                yaw_deg = float(rect_virtual[2])
+                while yaw_deg > 45.0: yaw_deg -= 90.0
+                while yaw_deg <= -45.0: yaw_deg += 90.0
+                
+        if yaw_deg is None:
+            xy_int = (base_pts[:, :2] * 10.0).astype(np.int32)
+            rect = cv2.minAreaRect(xy_int)
+            yaw_deg = float(rect[2])
+            while yaw_deg > 45.0: yaw_deg -= 90.0
+            while yaw_deg <= -45.0: yaw_deg += 90.0
+            
+        return {'center_xyz_mm': (cx, cy, cz), 'cube_yaw_deg': yaw_deg, 'yaw_src': 'robust'}
+
     def _yaw_from_depth_bbox(self, depth_frame, bbox):
+
         """YOLO bbox 내부의 깊이 데이터로 cube top 평면을 mask 화 → minAreaRect → base yaw.
         seg polygon 이 axis-aligned 라도 깊이는 회전을 보존해서 진짜 마름모 방향을 추출.
         실패 시 None."""
@@ -552,19 +687,29 @@ class CubeDetector:
                     cv2.putText(dbg, f'rej:{reason}', (x1, max(15, y1 - 6)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 200), 1)
                 continue
-            # 잡기 픽셀: mask centroid (cube top 무게중심). 없으면 bbox center.
             cen = self._polygon_centroid_px(poly)
             if cen is None:
                 u, v = int(cx), int(cy)
             else:
                 u, v = cen
-            # base 좌표: mask 영역의 depth percentile (cube top 표면) 기반.
             base = self._polygon_to_base(df, poly, (u, v))
             if base is None:
                 continue
             bbox = (int(cx - w / 2), int(cy - h / 2),
                     int(cx + w / 2), int(cy + h / 2))
-            yaw, yaw_src = self._refine_yaw_multi(color, df, bbox, poly)
+                    
+            fit = self._compute_top_face_center_and_yaw(color, df, bbox)
+            if fit is not None:
+                base = fit['center_xyz_mm']
+                yaw = fit['cube_yaw_deg']
+                yaw_src = fit['yaw_src']
+                T_base2cam = np.linalg.inv(self.T_cam2base)
+                p_base_m = np.array([base[0]/1000.0, base[1]/1000.0, base[2]/1000.0, 1.0])
+                cam_m = T_base2cam @ p_base_m
+                pixel = rs.rs2_project_point_to_pixel(self.intr, cam_m[:3])
+                u, v = int(round(pixel[0])), int(round(pixel[1]))
+            else:
+                yaw, yaw_src = self._refine_yaw_multi(color, df, bbox, poly)
             rhombus_pts = self._get_projected_rhombus(base, yaw)
             out.append({
                 'base_xyz_mm': (float(base[0]), float(base[1]), float(base[2])),
@@ -620,11 +765,23 @@ class CubeDetector:
                 if r is not None:
                     xywh = r.boxes.xywh.cpu().numpy()
                     confs = r.boxes.conf.cpu().numpy()
+                    cls_ids = r.boxes.cls.cpu().numpy()
                     polys = (r.masks.xy if r.masks is not None else [None] * len(xywh))
                     for i in range(len(xywh)):
                         cx, cy, w, h = xywh[i]
                         poly = polys[i] if i < len(polys) else None
-                        # 품질 검증 — false positive reject (즉시 빨간 박스, 트래킹 대상 아님)
+                        cls_id = int(cls_ids[i])
+                        
+                        # Side face 그리기
+                        if cls_id != 0:
+                            x1, y1 = int(cx - w / 2), int(cy - h / 2)
+                            x2, y2 = int(cx + w / 2), int(cy + h / 2)
+                            cv2.rectangle(vis, (x1, y1), (x2, y2), (255, 0, 0), 1)
+                            if poly is not None and len(poly) >= 3:
+                                cv2.polylines(vis, [poly.astype(np.int32)], True, (255, 100, 100), 1)
+                            continue
+
+                        # 품질 검증 — false positive reject
                         ok, reason = self._polygon_quality_ok(poly)
                         if not ok:
                             x1, y1 = int(cx - w / 2), int(cy - h / 2)
@@ -634,6 +791,7 @@ class CubeDetector:
                                         (x1, max(15, y1 - 5)),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 200), 1)
                             continue
+                            
                         cen = self._polygon_centroid_px(poly)
                         if cen is None:
                             u, v = int(cx), int(cy)
@@ -644,7 +802,23 @@ class CubeDetector:
                             continue
                         bbox = (int(cx - w / 2), int(cy - h / 2),
                                 int(cx + w / 2), int(cy + h / 2))
-                        yaw, yaw_src = self._refine_yaw_multi(color, df, bbox, poly)
+                                
+                        fit = self._compute_top_face_center_and_yaw(color, df, bbox)
+                        if fit is not None:
+                            base = fit['center_xyz_mm']
+                            yaw = fit['cube_yaw_deg']
+                            yaw_src = fit['yaw_src']
+                            T_base2cam = np.linalg.inv(self.T_cam2base)
+                            p_base_m = np.array([base[0]/1000.0, base[1]/1000.0, base[2]/1000.0, 1.0])
+                            cam_m = T_base2cam @ p_base_m
+                            pixel = rs.rs2_project_point_to_pixel(self.intr, cam_m[:3])
+                            u, v = int(round(pixel[0])), int(round(pixel[1]))
+                        else:
+                            yaw = self._polygon_to_base_yaw(df, poly)
+                            yaw_src = 'top_poly'
+                            if yaw is None:
+                                yaw, yaw_src = 0.0, 'fail'
+                            
                         dets.append({
                             'base_xyz_mm': (float(base[0]), float(base[1]), float(base[2])),
                             'pixel': (u, v),
@@ -686,7 +860,7 @@ class CubeDetector:
                         d['base_xyz_mm'], d['cube_yaw_deg'])
                     if bbox is not None:
                         x1, y1, x2, y2 = bbox
-                        cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 1)
                         if poly is not None and len(poly) >= 3:
                             cv2.polylines(vis, [poly.astype(np.int32)], True, (255, 0, 255), 1)
                     else:
@@ -696,9 +870,9 @@ class CubeDetector:
                         y1 = int(rp[:, 1].min())
                         x2 = int(rp[:, 0].max())
                         y2 = int(rp[:, 1].max())
-                    cv2.circle(vis, d['pixel'], 4, (0, 0, 255), -1)
+                    cv2.circle(vis, d['pixel'], 2, (0, 0, 255), -1)
                     if d.get('rhombus_pts') is not None:
-                        thick = 3 if d.get('locked') else 1
+                        thick = 2 if d.get('locked') else 1
                         color_rh = (180, 220, 255) if is_ghost else (0, 255, 255)
                         cv2.polylines(vis, [d['rhombus_pts']], True, color_rh, thick)
                     yaw, yaw_src = d['cube_yaw_deg'], d.get('yaw_src', '?')
@@ -709,22 +883,22 @@ class CubeDetector:
                     cv2.putText(vis,
                                 f'#{d.get("track_id", "?")} {conf:.2f}{yaw_str}{lock_str}',
                                 (x1, max(15, y1 - 5)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, label_color, 2)
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, label_color, 1)
                     bx, by, bz = d['base_xyz_mm']
                     cv2.putText(vis, f'({bx:.0f},{by:.0f},{bz:.0f})mm',
                                 (x1, min(color.shape[0] - 5, y2 + 14)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 200, 255), 1)
 
                 if custom_msg:
-                    cv2.putText(vis, f'detected={len(dets)}', (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    cv2.putText(vis, f'detected={len(dets)}', (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
                     y_offset = 55
                     for line in custom_msg:
-                        cv2.putText(vis, line, (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                        cv2.putText(vis, line, (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
                         y_offset += 25
                 else:
                     cv2.putText(vis,
                                 f'detected={len(dets)}  ENTER=confirm  s=shot  q=quit',
-                                (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                                (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
                 cv2.imshow(win, vis)
                 k = cv2.waitKey(20) & 0xFF
                 if k in (ord('q'), 27):
@@ -794,8 +968,9 @@ def _wrap_yaw_pm90(yaw):
 def pick_yaw_avoiding_neighbors(target_idx, dets, base_yaw, used_indices=None):
     """cube 가 정사각형 → yaw 와 yaw+90 두 방향 중 finger 가 인접 cube 와 충돌
     안 하는 쪽 선택. used_indices 의 cube 는 이미 옮겨져서 검사 안 함.
-    둘 다 충돌이면 clearance 더 큰 쪽 + 경고 출력.
-    반환: 선택된 yaw (deg, -90~+90 범위, parallel-jaw 180° 대칭 wrap 적용)."""
+    둘 다 충돌이면 45°/135° (대각선 잡기) 도 시도. 모두 충돌이면 clearance 더 큰 쪽.
+    반환: (yaw_deg, is_diagonal). yaw 는 -90~+90 범위 (parallel-jaw 180° wrap).
+          is_diagonal=True 면 대각선 잡기 (모서리에 finger) — 호출자가 pre-open 폭 ↑."""
     used_indices = used_indices or set()
     cx, cy, _ = dets[target_idx]['base_xyz_mm']
     candidates = []
@@ -822,13 +997,46 @@ def pick_yaw_avoiding_neighbors(target_idx, dets, base_yaw, used_indices=None):
         candidates.append((yaw_try, min_clearance, worst_neighbor))
 
     best_yaw, best_clr, best_nb = max(candidates, key=lambda c: c[1])
+    is_diagonal = False
+
+    # 변 잡기 (0°/90°) 둘 다 finger 공간 부족 → 대각선 잡기 (45°/135°, cube 코너 끼움)
+    # 시도. cube 가 정사각형이라 4-fold 대칭 + 45° 회전한 두 후보가 추가 가능.
+    # 대각선 잡기는 finger 가 cube 변이 아닌 코너에 닿아 인접 cube 와 대각 공간으로 진입.
     if best_clr < FINGER_CLEARANCE_MIN_MM:
-        print(f'    !! cube #{target_idx} — yaw 두 방향 모두 finger 공간 부족 '
+        diag_candidates = []
+        for yaw_try in (base_yaw + 45.0, base_yaw + 135.0):
+            rad = math.radians(yaw_try)
+            fdx = FINGER_DIST_MM * math.cos(rad)
+            fdy = FINGER_DIST_MM * math.sin(rad)
+            f1 = (cx + fdx, cy + fdy)
+            f2 = (cx - fdx, cy - fdy)
+            min_clearance = float('inf')
+            worst_neighbor = None
+            for i, d in enumerate(dets):
+                if i == target_idx or i in used_indices:
+                    continue
+                bx, by, _ = d['base_xyz_mm']
+                for fp in (f1, f2):
+                    dist = math.hypot(bx - fp[0], by - fp[1])
+                    if dist < min_clearance:
+                        min_clearance = dist
+                        worst_neighbor = i
+            diag_candidates.append((yaw_try, min_clearance, worst_neighbor))
+
+        diag_best = max(diag_candidates, key=lambda c: c[1])
+        if diag_best[1] > best_clr:
+            best_yaw, best_clr, best_nb = diag_best
+            is_diagonal = True
+            print(f'    대각선 잡기 채택: yaw={best_yaw:+.1f}° clr={best_clr:.0f}mm '
+                  f'(변 잡기 공간 부족 → 코너로 진입, pre-open ↑)')
+
+    if best_clr < FINGER_CLEARANCE_MIN_MM:
+        print(f'    !! cube #{target_idx} — 변/대각 모든 방향 finger 공간 부족 '
               f'(최대 clearance {best_clr:.0f}mm, 인접 cube #{best_nb}). 그대로 시도')
     else:
-        # 어느 방향이 선택됐는지 로그
+        # 어느 방향이 선택됐는지 로그 (대각 fallback 채택은 위에서 이미 출력)
         original_clr = candidates[0][1]
-        if best_yaw != base_yaw:
+        if best_yaw == base_yaw + 90.0:
             print(f'    finger 회피: 원래 yaw={base_yaw:+.1f}° clr={original_clr:.0f}mm → '
                   f'90° 회전 yaw={best_yaw:+.1f}° clr={best_clr:.0f}mm '
                   f'(인접 cube #{best_nb} 회피)')
@@ -845,7 +1053,7 @@ def pick_yaw_avoiding_neighbors(target_idx, dets, base_yaw, used_indices=None):
         print(f'    0° snap 보정: yaw {wrapped:+.1f}° → {biased:+.1f}° '
               f'(축정렬 학습 편향 보상)')
         wrapped = biased
-    return float(wrapped)
+    return float(wrapped), bool(is_diagonal)
 
 
 def pick_yaw_for_grid_cell(target_idx, cell_positions, base_yaw, used_indices=None):
@@ -956,6 +1164,22 @@ def gripper_set_width(robot, width_mm: float, settle=GRIPPER_SETTLE_SEC):
     return robot.gripper_set(pos, settle=settle, label=f'W{width_mm:.0f}mm')
 
 
+def gradual_gripper_release(robot, end_width_mm=None, n_steps=3, step_settle=0.08):
+    """그리퍼를 N 단계로 점진적 open — close 상태에서 release_width 까지.
+    "팍" 놓지 않고 cube 가 cell 표면에 부드럽게 안착하도록.
+    """
+    if end_width_mm is None:
+        end_width_mm = RELEASE_WIDTH_MM
+    start_width = CUBE_WIDTH_MM   # close 후 finger 가 cube 옆에 닿은 상태
+    for i in range(1, n_steps + 1):
+        width = start_width + (end_width_mm - start_width) * i / n_steps
+        is_last = (i == n_steps)
+        settle = GRIPPER_SETTLE_SEC if is_last else step_settle
+        gripper_set_width(robot, width, settle=settle)
+
+
+
+
 def fast_gripper_close(robot):
     """12번 gripper_close 는 settle=1.0 → 0.4 로 단축한 버전."""
     return robot.gripper_set(p12.GRIP_CLOSE_POS, settle=GRIPPER_SETTLE_SEC, label='CLOSE')
@@ -971,7 +1195,7 @@ def execute_one_cycle(robot, target, cell_xy, args):
     print(f'\n  >> cube @ ({bx:.1f}, {by:.1f}, {bz:.1f}) yaw={yaw_str} '
           f'→ cell ({cell_xy[0]:.0f}, {cell_xy[1]:.0f})')
 
-    pick_rpy = [0.0, 180.0, yaw_used]
+    pick_rpy = [0.0, 180.0, yaw_used]                       # descent / lift 자세 = cube 변 정렬
     # 모든 cube 는 grid 에 yaw=0° 로 release — 다음 단계(탑쌓기 등) 가 axis-aligned 가정.
     place_rpy = [0.0, 180.0, 0.0]
 
@@ -985,33 +1209,58 @@ def execute_one_cycle(robot, target, cell_xy, args):
     place_app = [cell_xy[0], cell_xy[1], pick_z + Z_APPROACH]
 
     dur = MOVE_DURATION_SEC
-    # ---- Pick ----
+    is_diagonal = bool(target.get('is_diagonal_grip', False))
+    pre_open_width = DIAG_PRE_OPEN_WIDTH_MM if is_diagonal else PRE_OPEN_WIDTH_MM
+
+    # ---- Pick approach (joint, 정지 없음) ----
+    # pre-open 그리퍼를 비동기로 발사 → motion 진행 중 동시에 열림.
+    # approach 는 joint 보간으로 빠르게 cube 위 80mm 까지.
     print('   [Pick]')
-    print(f'    1) approach → {[round(v, 1) for v in approach]}  yaw={yaw_used:+.1f}°')
-    if not args.dry_run: robot.move_line_base(approach, rpy_deg=pick_rpy, duration=dur)
-    print(f'    2) pre-open ({PRE_OPEN_WIDTH_MM:.0f}mm)')
-    if not args.dry_run: gripper_set_width(robot, PRE_OPEN_WIDTH_MM)
-    print(f'    3) descend → {[round(v, 1) for v in pick]}')
-    if not args.dry_run: robot.move_line_base(pick, rpy_deg=pick_rpy, duration=dur)
-    print(f'    4) close (잡기)')
+    print(f'    1) pre-open async ({pre_open_width:.0f}mm'
+          f'{" — diagonal" if is_diagonal else ""}) + '
+          f'approach → {[round(v, 1) for v in approach]}')
+    if not args.dry_run:
+        robot.gripper_set(width_mm_to_pos(pre_open_width),
+                          settle=0.0, label=f'PRE_OPEN_async_{pre_open_width:.0f}mm')
+        robot.move_line_base(approach, rpy_deg=pick_rpy, duration=dur)
+
+    # 2) pick descend — 카르테시안 직선 80mm (옆 cube 안 치고 수직 강하)
+    print(f'    2) pick descend (cartesian, 직선 {Z_APPROACH:.0f}mm) → {[round(v, 1) for v in pick]}')
+    if not args.dry_run:
+        robot.move_line_cartesian(pick, rpy_deg=pick_rpy)
+
+    # 3) close (잡기)
+    print(f'    3) close (잡기)')
     if not args.dry_run: fast_gripper_close(robot)
-    print(f'    5) lift → {[round(v, 1) for v in lift]}')
-    if not args.dry_run: robot.move_line_base(lift, rpy_deg=pick_rpy, duration=dur)
 
-    # ---- Align (cube 와 함께 yaw=0 으로 회전) ----
+    # ---- Transit (multi-WP, 한 trajectory action 으로 통과 — 정지 없음) ----
+    # cube 잡힌 위치 → lift → [yaw align] → place_app (target cell 위 80mm) 까지.
+    # place descend 는 분리 — 카르테시안 직선으로.
+    transit = [(lift, pick_rpy)]
     if abs(yaw_used) > 0.5:
-        print(f'    6) align: yaw {yaw_used:+.1f}° → 0°')
-        if not args.dry_run: robot.move_line_base(lift, rpy_deg=place_rpy, duration=dur)
+        transit.append((lift, place_rpy))          # 같은 XYZ 에서 yaw=0 align
+    transit.append((place_app, place_rpy))           # target cell 위 (descend 직전)
+    align_note = ' + align yaw→0' if abs(yaw_used) > 0.5 else ''
+    print(f'    4) transit (lift{align_note} → above cell) — {len(transit)} WP')
+    for wp, rp in transit:
+        print(f'       · {[round(v, 1) for v in wp]} rpy={[round(v,1) for v in rp]}')
+    if not args.dry_run:
+        robot.move_line_base_multi_smooth(transit)
 
-    # ---- Place ----
-    print('   [Place]')
-    print(f'    1) above cell → {[round(v, 1) for v in place_app]}')
-    if not args.dry_run: robot.move_line_base(place_app, rpy_deg=place_rpy, duration=dur)
-    print(f'    2) descend → {[round(v, 1) for v in place]}')
-    if not args.dry_run: robot.move_line_base(place, rpy_deg=place_rpy, duration=dur)
-    print(f'    3) open {RELEASE_WIDTH_MM:.0f}mm (release)')
-    if not args.dry_run: gripper_set_width(robot, RELEASE_WIDTH_MM)
-    print(f'    4) lift up')
+    # 5) place descend — 카르테시안 직선 80mm (옆 cell cube 와 부딪힘 회피)
+    print(f'    5) place descend (cartesian, 직선 {Z_APPROACH:.0f}mm) → {[round(v, 1) for v in place]}')
+    if not args.dry_run:
+        robot.move_line_cartesian(place, rpy_deg=place_rpy)
+
+    # ---- Place 동기 + 점진 release + lift up ----
+    # 놓기 직전 짧은 동기 wait — descend 종점 settle.
+    # 그 후 gradual release — "팍" 놓지 말고 단계적으로 finger 열어서 cube 가 cell
+    # 표면에 부드럽게 안착 (점프/튕김 방지).
+    if not args.dry_run: time.sleep(0.15)
+    print(f'    6) gradual release → {RELEASE_WIDTH_MM:.0f}mm (3 steps)')
+    if not args.dry_run: gradual_gripper_release(robot, n_steps=3)
+
+    print(f'    7) lift up → {[round(v, 1) for v in place_app]}')
     if not args.dry_run:
         robot.move_line_base(place_app, rpy_deg=place_rpy, duration=dur)
 
@@ -1196,8 +1445,9 @@ def main():
             # 인접 cube 회피: yaw 와 yaw+90 중 finger 공간 있는 쪽 선택
             target = dets[cube_idx]
             raw_yaw = target.get('cube_yaw_deg', 0.0) or 0.0
-            safe_yaw = pick_yaw_avoiding_neighbors(cube_idx, dets, raw_yaw, used)
-            target_with_safe_yaw = {**target, 'cube_yaw_deg': safe_yaw}
+            safe_yaw, is_diagonal = pick_yaw_avoiding_neighbors(cube_idx, dets, raw_yaw, used)
+            target_with_safe_yaw = {**target, 'cube_yaw_deg': safe_yaw,
+                                     'is_diagonal_grip': is_diagonal}
             print(f'    cube #{cube_idx} → cell {mapping[cube_idx]} {target_cell}')
             execute_one_cycle(robot, target_with_safe_yaw, target_cell, args)
             old = dets[cube_idx]

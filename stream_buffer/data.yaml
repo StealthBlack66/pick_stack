@@ -1,0 +1,6 @@
+
+path: /home/fastcampus/Downloads/test/로봇강의_예제/02_Doosan_Robot_제어/stream_buffer
+train: images/train
+val: images/train
+names:
+  0: cube

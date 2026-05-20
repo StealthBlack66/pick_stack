@@ -93,37 +93,41 @@ def execute_stack_pick_place(robot, source_xyz_mm, source_yaw_deg,
 
     dur = p15.MOVE_DURATION_SEC
 
-    # Group A: transit_src_safe → approach (그리퍼 동작 없는 구간 묶기 → 정지 없음)
-    print(f'   [Group A] transit over source → approach @ safe z={safe_z:.0f} yaw={source_yaw_deg:+.0f}°')
+    # Group A: transit_src_safe → approach (Doosan native spline — 부드럽고 빠름)
+    print(f'   [Group A] transit over source → approach @ safe z={safe_z:.0f} yaw={source_yaw_deg:+.0f}° [native spline]')
     if not args.dry_run:
-        robot.move_line_base_multi([
+        robot.move_line_base_multi_smooth([
             (transit_src_safe, pick_rpy),
             (approach, pick_rpy),
-        ], [dur, dur])
+        ])
 
     # Gripper pre-open
     print(f'    pre-open {pre_open_width_mm:.0f}mm')
     if not args.dry_run: p15.gripper_set_width(robot, pre_open_width_mm)
 
-    # Group B: descend only (single segment, no group)
-    print(f'    descend {[round(v, 1) for v in pick]}')
-    if not args.dry_run: robot.move_line_base(pick, rpy_deg=pick_rpy, duration=dur)
+    # Group B: pick descend — 카르테시안 직선 (옆 cube 안 치고 수직 강하)
+    print(f'    descend (cartesian) {[round(v, 1) for v in pick]}')
+    if not args.dry_run: robot.move_line_cartesian(pick, rpy_deg=pick_rpy)
 
     # Gripper close
     print(f'    close')
     if not args.dry_run: p15.fast_gripper_close(robot)
 
-    # Group C: lift → [rotate] → transit_tgt_safe → place_app → place (5 waypoints, 끊김 없음)
-    print(f'   [Group C] lift → transit → place')
+    # Group C: lift → [rotate] → transit_tgt_safe → place_app (대각, joint 보간 OK).
+    # place descend 는 분리해서 카르테시안 직선으로.
+    print(f'   [Group C] lift → transit → above target')
     motion_C = [(transit_lift_safe, pick_rpy)]
     if abs(source_yaw_deg - target_yaw_deg) > 0.5:
         # 같은 XYZ 에서 yaw 만 회전
         motion_C.append((transit_lift_safe, place_rpy))
     motion_C.append((transit_tgt_safe, place_rpy))
     motion_C.append((place_app, place_rpy))
-    motion_C.append((place, place_rpy))
     if not args.dry_run:
-        robot.move_line_base_multi(motion_C, [dur] * len(motion_C))
+        robot.move_line_base_multi_smooth(motion_C)
+
+    # place descend — 카르테시안 직선 (탑 옆면 / 인접 cube 와 부딪힘 회피)
+    print(f'    place descend (cartesian) {[round(v, 1) for v in place]}')
+    if not args.dry_run: robot.move_line_cartesian(place, rpy_deg=place_rpy)
 
     # Gripper open
     print(f'    open {p15.RELEASE_WIDTH_MM:.0f}mm (release)')

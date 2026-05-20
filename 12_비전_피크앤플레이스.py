@@ -46,6 +46,8 @@ from dsr_msgs2.srv import (
     SetRobotMode, SetRobotControl, Ikin, GetCurrentPose,
     GetRobotState, SetSafetyMode, SetSafeStopResetType,
     FlangeSerialOpen, FlangeSerialClose, FlangeSerialWrite,
+    ChangeCollisionSensitivity, ChangeOperationSpeed,
+    MoveLine,
 )
 
 try:
@@ -85,8 +87,19 @@ HOME_JOINT_DEG = [0.0, 0.0, 90.0, 0.0, 90.0, 0.0]   # 안전한 시작 자세 (d
 TOP_DOWN_RPY_DEG = [0.0, 180.0, 0.0]                # 그리퍼가 -Z(아래) 향하는 자세 (deg)
 
 # 모션 시간 (FollowJointTrajectory: time_from_start)
-MOVE_DURATION_SEC = 5.0     # 한 segment 이동 시간 (초). 짧을수록 빠름·거칠어짐
+# 짧을수록 빠름·거칠어짐. status=6 retry + goal_time_tolerance=2s + change_operation_speed=100
+# 위에서 1.5 까지 단축 시도. 만약 path tolerance abort 자주 발생하면 다시 2.0 / 2.5 로.
+MOVE_DURATION_SEC = 1.5
 JOINT_NAMES = ['joint_1', 'joint_2', 'joint_3', 'joint_4', 'joint_5', 'joint_6']
+
+# Doosan native motion (move_spline_task / move_line) 의 vel/acc.
+# vel=[mm/s, deg/s], acc=[mm/s², deg/s²]. 처음엔 보수적으로 시작 → 안정 확인 후 키울 것.
+# 너무 공격적 (250/100, 500/200) 이면 move_spline_task success=False 반환 가능.
+NATIVE_VEL = [150.0, 60.0]
+NATIVE_ACC = [300.0, 120.0]
+# 시작 시 한 번 세팅
+COLLISION_SENSITIVITY = 30   # 0~100. 기본 50 보다 낮춰서 trapezoidal 시작 spike 오인 방지.
+OPERATION_SPEED = 100        # 1~100 전역 속도 배율. native vel/acc 와 곱셈으로 적용.
 
 # 두산 e0509 펌웨어가 적용하는 실제 관절 한계 (URDF 보다 빡빡할 수 있음).
 # Ikin 결과가 이 안에 들어와야 trajectory action 이 abort 안 됨. 안전 마진 포함.
@@ -439,10 +452,19 @@ class PickAndPlace(Node):
         self.cli_get_state   = self.create_client(GetRobotState,         f'/{NS}/system/get_robot_state')
         self.cli_safety_mode = self.create_client(SetSafetyMode,         f'/{NS}/system/set_safety_mode')
         self.cli_safe_reset  = self.create_client(SetSafeStopResetType,  f'/{NS}/system/set_safe_stop_reset_type')
+        # 실 로봇 매끄러움 튜닝
+        self.cli_collision = self.create_client(ChangeCollisionSensitivity,
+                                                 f'/{NS}/system/change_collision_sensitivity')
+        self.cli_op_speed = self.create_client(ChangeOperationSpeed,
+                                                f'/{NS}/motion/change_operation_speed')
+        # 카르테시안 직선 단발 (pick / place descend 의 수직 강하 보장용)
+        self.cli_move_line = self.create_client(MoveLine, f'/{NS}/motion/move_line')
         # 현재 활성 top-down 자세 (사용자가 cal_top_down 으로 갱신 가능)
         self.top_down_rpy = list(TOP_DOWN_RPY_DEG)
         # 그리퍼 TCP z 오프셋 (런타임에 set_tcp_z 명령으로 갱신 가능)
         self.tcp_z_offset = float(GRIPPER_TCP_OFFSET_Z)
+        # 직전 IK 성공 sol_space — 다음 호출에서 우선 시도해서 손목 ±180° flip 방지
+        self._last_ik_sol = None
         # MoveIt 컨트롤러 trajectory 액션 (RViz 에 보이는 그 액션)
         self.traj_action = ActionClient(
             self, FollowJointTrajectory,
@@ -532,6 +554,13 @@ class PickAndPlace(Node):
         self._wait(self.cli_mode, 'set_robot_mode')
         self._wait(self.cli_ctrl, 'set_robot_control')
 
+        # 0a) 이전 run 잔여 trajectory goal idle 처리
+        # rclpy ActionClient 는 cancel_all_goals 미공개 → action 서버 연결만 확인하고
+        # 1초 wait 으로 컨트롤러가 stale goal 을 자체 종료하도록 둠.
+        # (시작 시 robot_state=2 MOVING 으로 보고되던 증상 회피)
+        if self.traj_action.wait_for_server(timeout_sec=1.0):
+            time.sleep(1.0)
+
         # 0) 충돌·safe-stop 자동 복구
         self.recover_safety(verbose=True)
 
@@ -552,6 +581,25 @@ class PickAndPlace(Node):
         # 3) 활성화 후 상태 한 번 더 확인
         final_s = self.get_robot_state()
         print(f'   활성화 후 robot_state={final_s} ({self._STATE_NAMES.get(final_s,"?")})')
+
+        # 4) 실 하드웨어 매끄러움 튜닝 (시뮬레이션은 무시되거나 무관)
+        # 4a) 충돌 감도 — 기본 50 은 trapezoidal 가속 시작 점의 force spike 를
+        #     충돌로 오인해서 잠깐 멈춤. 30 정도로 낮추면 안정. 너무 낮추면 실 충돌 위험.
+        if self.cli_collision.wait_for_service(timeout_sec=1.0):
+            req = ChangeCollisionSensitivity.Request()
+            req.sensitivity = COLLISION_SENSITIVITY
+            r = self._call(self.cli_collision, req, timeout=3.0)
+            if r and r.success:
+                print(f'   collision sensitivity = {COLLISION_SENSITIVITY}/100')
+            else:
+                print('   (collision sensitivity 설정 실패 — 무시하고 계속)')
+        # 4b) 전역 속도 배율 — 100 이 native vel/acc 그대로
+        if self.cli_op_speed.wait_for_service(timeout_sec=1.0):
+            req = ChangeOperationSpeed.Request()
+            req.speed = OPERATION_SPEED
+            r = self._call(self.cli_op_speed, req, timeout=3.0)
+            if r and r.success:
+                print(f'   operation speed = {OPERATION_SPEED}/100')
 
     # ---- 그리퍼 ----
     def gripper_init(self):
@@ -693,6 +741,9 @@ class PickAndPlace(Node):
             g_tol.name = jn
             g_tol.position = 0.05
             goal.goal_tolerance.append(g_tol)
+        # 기본값 Duration(0,0) 이면 trajectory 종료 시각에서 단 1ms 라도 늦으면 ABORTED(status=6).
+        # +2s 마진 → 컨트롤러 trapezoidal lag 흡수.
+        goal.goal_time_tolerance = Duration(sec=2, nanosec=0)
 
         send_fut = self.traj_action.send_goal_async(goal)
         rclpy.spin_until_future_complete(self, send_fut, timeout_sec=10.0)
@@ -703,6 +754,16 @@ class PickAndPlace(Node):
         result_fut = gh.get_result_async()
         rclpy.spin_until_future_complete(self, result_fut, timeout_sec=duration + 30.0)
         status = result_fut.result().status
+        if status == 6:
+            # 일시적 controller race — 300ms 대기 후 1회 재전송
+            time.sleep(0.3)
+            send_fut = self.traj_action.send_goal_async(goal)
+            rclpy.spin_until_future_complete(self, send_fut, timeout_sec=10.0)
+            gh = send_fut.result()
+            if gh is not None and gh.accepted:
+                result_fut = gh.get_result_async()
+                rclpy.spin_until_future_complete(self, result_fut, timeout_sec=duration + 30.0)
+                status = result_fut.result().status
         if status != 4:   # GoalStatus.STATUS_SUCCEEDED
             raise RuntimeError(f'Trajectory 실행 실패 (status={status})')
 
@@ -750,6 +811,26 @@ class PickAndPlace(Node):
                         sec=int(t), nanosec=int((t - int(t)) * 1e9))
                     goal.trajectory.points.append(pt)
 
+        # 중간 waypoint pass-through 매끄럽게 — velocity 미지정 시 controller 가
+        # 각 waypoint 에서 v=0 으로 해석해서 멈췄다 가속 → 버벅임. 인접 waypoint 차분으로
+        # 추정해 채워주면 spline 이 연속 통과. 마지막 waypoint 만 v=0 (정지).
+        pts = goal.trajectory.points
+        if len(pts) >= 2:
+            times = [p.time_from_start.sec + p.time_from_start.nanosec * 1e-9
+                     for p in pts]
+            njoints = len(pts[0].positions)
+            for i in range(len(pts) - 1):   # 마지막은 v=0 유지 (아래에서 명시)
+                if i == 0:
+                    dt_seg = max(times[1] - times[0], 1e-6)
+                    vel = [(pts[1].positions[j] - pts[0].positions[j]) / dt_seg
+                           for j in range(njoints)]
+                else:
+                    dt_total = max(times[i + 1] - times[i - 1], 1e-6)
+                    vel = [(pts[i + 1].positions[j] - pts[i - 1].positions[j]) / dt_total
+                           for j in range(njoints)]
+                pts[i].velocities = vel
+            pts[-1].velocities = [0.0] * njoints
+
         # Path/goal tolerance 완화 (단일 endpoint trajectory 와 동일)
         for jn in JOINT_NAMES:
             pt_tol = JointTolerance()
@@ -760,6 +841,8 @@ class PickAndPlace(Node):
             g_tol.name = jn
             g_tol.position = 0.05
             goal.goal_tolerance.append(g_tol)
+        # 기본 0 이면 trajectory 종료 시각 초과 시 즉시 ABORTED — +2s 마진
+        goal.goal_time_tolerance = Duration(sec=2, nanosec=0)
 
         send_fut = self.traj_action.send_goal_async(goal)
         rclpy.spin_until_future_complete(self, send_fut, timeout_sec=10.0)
@@ -770,6 +853,15 @@ class PickAndPlace(Node):
         result_fut = gh.get_result_async()
         rclpy.spin_until_future_complete(self, result_fut, timeout_sec=t + 30.0)
         status = result_fut.result().status
+        if status == 6:
+            time.sleep(0.3)
+            send_fut = self.traj_action.send_goal_async(goal)
+            rclpy.spin_until_future_complete(self, send_fut, timeout_sec=10.0)
+            gh = send_fut.result()
+            if gh is not None and gh.accepted:
+                result_fut = gh.get_result_async()
+                rclpy.spin_until_future_complete(self, result_fut, timeout_sec=t + 30.0)
+                status = result_fut.result().status
         if status != 4:
             raise RuntimeError(f'Multi-WP Trajectory 실패 (status={status})')
 
@@ -792,6 +884,79 @@ class PickAndPlace(Node):
                 [float(x), float(y), float(z),
                  float(rpy_deg[0]), float(rpy_deg[1]), float(rpy_deg[2])]))
         self._send_trajectory_multi(joints_list, segment_durations)
+
+    def move_line_base_multi_smooth(self, waypoints_xyz_rpy,
+                                     vel=None, acc=None):
+        """검증된 ros2_control multi-WP trajectory 한 가지 path 로 통일.
+
+        이전엔 Doosan native motion/move_spline_task 를 사용했으나 실 로봇에서:
+          - rpy=[0,180,0] 근처 wrist singularity 에서 spline 보간 fail
+          - dt jitter / system 부하 시 controller 가 abort
+        등의 이유로 안정성이 떨어져서, 검증된 move_line_base_multi (IK 풀어서
+        FollowJointTrajectory 로 보내는 path) 하나로 통일.
+
+        호환성을 위해 동일 signature 유지. vel/acc 인자는 무시됨 (segment 당
+        고정 duration 사용 — 부드러움은 _send_trajectory_multi 의 velocity hint
+        + goal_time_tolerance 가 보장).
+        """
+        if not waypoints_xyz_rpy:
+            raise ValueError('waypoints 비어있음')
+        # vel/acc 인자는 받지만 사용 안 함 (호환성 유지). 신호만 안 보이게 처리.
+        _ = vel, acc
+        durations = [MOVE_DURATION_SEC] * len(waypoints_xyz_rpy)
+        self.move_line_base_multi(waypoints_xyz_rpy, durations)
+
+    def move_line_cartesian(self, xyz_mm, rpy_deg=None,
+                             vel=None, acc=None):
+        """Doosan native motion/move_line — 단발 카르테시안 직선 보장.
+
+        pick descend / place descend 처럼 수직 강하해야 하는 segment 에 사용.
+        중간 경로가 직선이라 cube 옆을 안 치고 정확히 위에서 들어감.
+
+        rpy_deg None → self.top_down_rpy 사용.
+        vel None → [150 mm/s, 60 deg/s]. acc None → [500 mm/s², 150 deg/s²].
+        e0509 spec 한계의 ~1/4 수준 — 안전하고 충분히 빠름.
+        """
+        if rpy_deg is None:
+            rpy_deg = self.top_down_rpy
+        if vel is None:
+            vel = [150.0, 60.0]
+        if acc is None:
+            acc = [500.0, 150.0]
+        x, y, z_user = xyz_mm
+        z = z_user + self.tcp_z_offset
+
+        # 작업영역 검증 (사용자 좌표 = 그리퍼 끝 기준)
+        if not (WORK_X[0] <= x <= WORK_X[1] and
+                WORK_Y[0] <= y <= WORK_Y[1] and
+                WORK_Z[0] <= z_user <= WORK_Z[1]):
+            raise RuntimeError(
+                f'좌표 {[round(v,1) for v in (x,y,z_user)]} mm (그리퍼 끝 기준) 가 작업영역 밖. '
+                f'X∈{WORK_X}, Y∈{WORK_Y}, Z∈{WORK_Z}.'
+            )
+
+        self._wait(self.cli_move_line, 'motion/move_line')
+        req = MoveLine.Request()
+        req.pos = [float(x), float(y), float(z),
+                    float(rpy_deg[0]), float(rpy_deg[1]), float(rpy_deg[2])]
+        req.vel = [float(vel[0]), float(vel[1])]
+        req.acc = [float(acc[0]), float(acc[1])]
+        req.time = 0.0       # vel/acc 로 자동 계산
+        req.radius = 0.0     # blending off — 끝점에서 정확히 멈춤
+        req.ref = 0          # DR_BASE
+        req.mode = 0         # ABSOLUTE
+        req.blend_type = 0   # BLENDING_SPEED_TYPE_DUPLICATE
+        req.sync_type = 0    # SYNC (blocking)
+        r = self._call(self.cli_move_line, req, timeout=30.0)
+        if not (r and r.success):
+            # cartesian 직선 fail 원인: task-space 직선 보간이 wrist singular / joint
+            # limit 통과 시 IK 가 중간점에서 fail. 이 경우 joint trajectory 로 fallback
+            # (cartesian 직선 보장 X, joint space 곡선이지만 거리 짧으면 충분히 직선
+            # 비슷). 단발 cube descend (~80mm) 정도면 옆 cube 안 침.
+            print(f'    [motion] move_line cartesian fail '
+                  f'(yaw={rpy_deg[2]:+.0f}° wrist singular 의심) → joint fallback')
+            self.move_line_base(xyz_mm, rpy_deg=rpy_deg,
+                                duration=MOVE_DURATION_SEC)
 
     def move_line_base(self, xyz_mm, rpy_deg=None, duration=MOVE_DURATION_SEC):
         """베이스 좌표 (mm/deg) → Ikin 으로 IK 풀고 trajectory 액션으로 이동.
@@ -828,9 +993,17 @@ class PickAndPlace(Node):
 
         두산 e0509 펌웨어가 URDF 보다 빡빡한 관절 한계(특히 joint_2/3 ±95°/±155°)
         를 적용하므로, sol_space=0 결과가 한계를 살짝 넘는 경우가 있음 → 다른 분기를 시도.
+
+        직전에 성공한 sol_space 를 우선 시도 (self._last_ik_sol) — pick 과 place 가
+        같은 cycle 안에서 일관된 분기를 쓰게 해서 손목 ±180° flip 방지.
         """
+        if self._last_ik_sol is not None:
+            tries = [self._last_ik_sol] + [s for s in IK_SOL_SPACE_TRIES
+                                            if s != self._last_ik_sol]
+        else:
+            tries = list(IK_SOL_SPACE_TRIES)
         attempts = []
-        for sol in IK_SOL_SPACE_TRIES:
+        for sol in tries:
             req = Ikin.Request()
             req.pos = list(pos)
             req.sol_space = int(sol)
@@ -849,6 +1022,7 @@ class PickAndPlace(Node):
             if violated:
                 attempts.append(f'sol={sol}: {",".join(violated)}')
                 continue
+            self._last_ik_sol = sol
             print(f'   IK 풀림 (sol_space={sol}): '
                   f'{[round(j, 2) for j in joints]} deg')
             return joints
