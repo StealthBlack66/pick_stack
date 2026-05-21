@@ -22,7 +22,6 @@ import importlib.util
 import math
 import os
 import sys
-import time
 from pathlib import Path
 
 import cv2
@@ -74,6 +73,9 @@ MIN_POLY_AREA_PX = 150      # 너무 작은 mask → 그림자/노이즈
 MAX_POLY_AREA_PX = 15000    # 매우 가까운 cube + 측면 포함도 통과하도록 관대
 MAX_POLY_ASPECT = 2.0       # 정사각형 cube top → 1 근처. 가까운 perspective 도 통과
 
+# preview 에서 사용자가 클릭으로 제거할 때 — 클릭 위치 ↔ detection pixel 매칭 반경 (px)
+CLICK_REMOVE_RADIUS_PX = 30
+
 # 트래킹 (마름모 요동 방지) — 프레임 간 같은 cube 매칭 + yaw/위치 EMA
 TRACK_MATCH_RADIUS_MM = 25.0  # base XY 이 거리 안이면 같은 cube
 TRACK_EMA_ALPHA = 0.15        # 새 관측 비율 (낮을수록 안정, 반응 느림)
@@ -84,6 +86,13 @@ TRACK_STALE_FRAMES = 10       # 이만큼 안 보이면 트랙 삭제
 CUBE_WIDTH_MM = 25.0
 PRE_OPEN_WIDTH_MM = 40.0
 RELEASE_WIDTH_MM = 27.0
+# detect 가 측정한 cube width 기반 동적 그리퍼 폭 계산용 clearance.
+# pre_open = cube_w_mm + PRE_OPEN_CLEARANCE_MM (descend 중 cube 안 치게 여유)
+# release  = cube_w_mm + RELEASE_CLEARANCE_MM  (살짝만 벌려서 부드럽게 안착)
+# close    = cube_w_mm - GRIP_CLOSE_OVERSHOOT_MM (finger 가 cube 옆에 살짝 dig)
+PRE_OPEN_CLEARANCE_MM = 15.0
+RELEASE_CLEARANCE_MM = 2.0
+GRIP_CLOSE_OVERSHOOT_MM = 2.0   # cube_w 보다 2mm 더 닫음 — finger 가 cube 강하게 잡음
 GRIP_RANGE_MM = 130.0    # RH-P12-RN-A 완전 열림(POS 0)에서 약 130mm 추정
 # 대각 잡기 (45°/135° yaw — cube 코너에 finger 가 닿음) 시 pre-open 폭.
 # cube 대각 = 25 × √2 ≈ 35.4mm. finger 가 cube 옆에 안 닿게 마진 포함해서 50mm.
@@ -98,13 +107,15 @@ YAW_NEAR_ZERO_BIAS_DEG = 15.0    # 위 경우에 사용할 회전량 (부호는 
 # 모션
 Z_APPROACH = 80.0
 Z_LIFT = 100.0
+# Release 시 cube 가 표면에 충돌하지 않게 z 올려서 떨어트림.
+# place_z = pick_z + RELEASE_LIFT_MM. cube 25mm 라 +5mm 면 cube 바닥이 표면 +5mm 위.
+RELEASE_LIFT_MM = 5.0
 
-# 한 segment 이동 시간 (12번 default 5.0 → 단축). 너무 짧으면 trajectory PATH_TOL 실패
-# goal_time_tolerance=2s + retry + operation_speed=100 + velocity hint 위에서 1.5 까지
-# 단축. status=6 path tolerance abort 자주면 2.0 / 2.5 / 3.0 순으로 복원.
-MOVE_DURATION_SEC = 1.5
-# 그리퍼 settle — RH-P12-RN-A 작은 변화는 0.2s 면 충분.
-GRIPPER_SETTLE_SEC = 0.2
+# 한 segment 이동 시간. 사용자 요청 "속도 느리게" → 5.0 으로 늘림 (부드럽고 천천히).
+# 너무 길면 답답함 ↔ 너무 짧으면 일자 느낌. 4.0 ~ 5.0 사이가 보통 적정.
+MOVE_DURATION_SEC = 5.0
+# 그리퍼 settle — RH-P12-RN-A 작은 변화는 0.1s 면 충분 (close 안정성 모니터 후 조정).
+GRIPPER_SETTLE_SEC = 0.1
 
 
 def width_mm_to_pos(width_mm: float) -> int:
@@ -146,6 +157,10 @@ class CubeDetector:
         self._tracks = {}
         self._next_tid = 0
         self._frame_idx = 0
+        # 사용자가 preview 에서 클릭으로 제거한 detection — track_id 기준 (locked
+        # 된 cube). track_id 없는 detection 은 pixel 좌표 기준 (proximity).
+        self._user_excluded_track_ids = set()
+        self._user_excluded_pixels = []   # [(u, v), ...] 매 frame proximity 매칭
 
     @staticmethod
     def _yaw_ema_pm45(old_deg, new_deg, alpha):
@@ -742,13 +757,58 @@ class CubeDetector:
     def preview_until_confirm(self, save_debug=None, custom_msg=None, valid_keys=None):
         """라이브 화면 + 검출 → 사용자 확인 후 그 시점 검출 반환.
         키:  ENTER/SPACE = 확정,  q/ESC = 취소,  s = 스크린샷
+        마우스: 좌클릭 = 클릭한 detection 제거 (회색 X 로 표시),
+               우클릭 = 제거 목록 모두 복원
         custom_msg: 화면에 표시할 텍스트 리스트
         valid_keys: 지정된 키가 눌리면 (dets, key) 반환
         """
-        win = 'YOLO preview (ENTER=confirm, s=shot, q=quit)'
+        win = 'YOLO preview (ENTER=confirm, click=remove, s=shot, q=quit)'
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-        print('  preview 시작 — ENTER 로 확정 (q=취소)')
+        print('  preview 시작 — ENTER 로 확정 / 좌클릭 = 제거 / 우클릭 = 복원 / q = 취소')
         self._reset_tracking()
+        # 마우스 콜백이 현재 frame 의 dets 를 보고 가장 가까운 것을 제거 → 클로저로
+        # 매 frame 갱신되는 mutable container 공유.
+        last_dets_ref = {'dets': []}
+
+        def _on_mouse(event, x, y, flags, param):
+            if event == cv2.EVENT_LBUTTONDOWN:
+                dets_now = last_dets_ref['dets']
+                if not dets_now:
+                    return
+                best = None
+                best_d2 = (CLICK_REMOVE_RADIUS_PX + 1) ** 2
+                for d in dets_now:
+                    pu, pv = d.get('pixel', (None, None))
+                    if pu is None:
+                        continue
+                    d2 = (pu - x) ** 2 + (pv - y) ** 2
+                    if d2 < best_d2:
+                        best_d2 = d2
+                        best = d
+                if best is None:
+                    print(f'  [click-remove] ({x},{y}) 근처 detection 없음 '
+                          f'(반경 {CLICK_REMOVE_RADIUS_PX}px)')
+                    return
+                tid = best.get('track_id')
+                if tid is not None:
+                    self._user_excluded_track_ids.add(int(tid))
+                    print(f'  [click-remove] track #{tid} 제거 '
+                          f'(누적 제거 {len(self._user_excluded_track_ids)}개)')
+                else:
+                    pu, pv = best['pixel']
+                    self._user_excluded_pixels.append((int(pu), int(pv)))
+                    print(f'  [click-remove] pixel ({pu},{pv}) 제거 (track_id 없음)')
+            elif event == cv2.EVENT_RBUTTONDOWN:
+                n = (len(self._user_excluded_track_ids)
+                     + len(self._user_excluded_pixels))
+                if n == 0:
+                    print('  [click-remove] 복원할 항목 없음')
+                    return
+                self._user_excluded_track_ids.clear()
+                self._user_excluded_pixels.clear()
+                print(f'  [click-remove] {n}개 제거 항목 모두 복원')
+
+        cv2.setMouseCallback(win, _on_mouse)
         try:
             while True:
                 frames = self.align.process(self.pipeline.wait_for_frames())
@@ -852,17 +912,38 @@ class CubeDetector:
                     dets.append(ghost)
                     draw_meta.append((None, 0.0, None))
 
+                # 사용자가 클릭으로 제거한 detection 표시 (track_id 또는 pixel 기준)
+                for d in dets:
+                    excluded = False
+                    tid = d.get('track_id')
+                    if tid is not None and int(tid) in self._user_excluded_track_ids:
+                        excluded = True
+                    else:
+                        pu, pv = d.get('pixel', (None, None))
+                        if pu is not None:
+                            for (eu, ev) in self._user_excluded_pixels:
+                                if (pu - eu) ** 2 + (pv - ev) ** 2 <= CLICK_REMOVE_RADIUS_PX ** 2:
+                                    excluded = True
+                                    break
+                    d['user_excluded'] = excluded
+
+                # 마우스 콜백이 참조할 dets 갱신
+                last_dets_ref['dets'] = dets
+
                 # 그리기 (평활된 값으로 rhombus 재계산 → 화면에 표시)
                 for d, meta in zip(dets, draw_meta):
                     bbox, conf, poly = meta
                     is_ghost = d.get('is_ghost', False)
+                    is_excluded = d.get('user_excluded', False)
                     d['rhombus_pts'] = self._get_projected_rhombus(
                         d['base_xyz_mm'], d['cube_yaw_deg'])
                     if bbox is not None:
                         x1, y1, x2, y2 = bbox
-                        cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 1)
+                        box_color = (120, 120, 120) if is_excluded else (0, 255, 0)
+                        cv2.rectangle(vis, (x1, y1), (x2, y2), box_color, 1)
                         if poly is not None and len(poly) >= 3:
-                            cv2.polylines(vis, [poly.astype(np.int32)], True, (255, 0, 255), 1)
+                            poly_color = (120, 120, 120) if is_excluded else (255, 0, 255)
+                            cv2.polylines(vis, [poly.astype(np.int32)], True, poly_color, 1)
                     else:
                         # ghost — bbox 없음, rhombus 기준 좌상 모서리로 라벨 위치 잡기
                         rp = d['rhombus_pts']
@@ -873,13 +954,20 @@ class CubeDetector:
                     cv2.circle(vis, d['pixel'], 2, (0, 0, 255), -1)
                     if d.get('rhombus_pts') is not None:
                         thick = 2 if d.get('locked') else 1
-                        color_rh = (180, 220, 255) if is_ghost else (0, 255, 255)
+                        if is_excluded:
+                            color_rh = (100, 100, 100)
+                        else:
+                            color_rh = (180, 220, 255) if is_ghost else (0, 255, 255)
                         cv2.polylines(vis, [d['rhombus_pts']], True, color_rh, thick)
                     yaw, yaw_src = d['cube_yaw_deg'], d.get('yaw_src', '?')
                     yaw_str = (f' y={yaw:+.0f}d[{yaw_src[0].upper()}]'
                                if yaw is not None else '')
                     lock_str = ' GHOST' if is_ghost else (' LOCK' if d.get('locked') else ' trk')
-                    label_color = (200, 200, 200) if is_ghost else (0, 255, 0)
+                    if is_excluded:
+                        label_color = (100, 100, 100)
+                        lock_str += ' [REMOVED]'
+                    else:
+                        label_color = (200, 200, 200) if is_ghost else (0, 255, 0)
                     cv2.putText(vis,
                                 f'#{d.get("track_id", "?")} {conf:.2f}{yaw_str}{lock_str}',
                                 (x1, max(15, y1 - 5)),
@@ -888,24 +976,33 @@ class CubeDetector:
                     cv2.putText(vis, f'({bx:.0f},{by:.0f},{bz:.0f})mm',
                                 (x1, min(color.shape[0] - 5, y2 + 14)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 200, 255), 1)
+                    # excluded 면 회색 X 오버레이 (가장 잘 보이게)
+                    if is_excluded:
+                        cv2.line(vis, (x1, y1), (x2, y2), (80, 80, 80), 2)
+                        cv2.line(vis, (x1, y2), (x2, y1), (80, 80, 80), 2)
 
+                n_kept = sum(1 for d in dets if not d.get('user_excluded'))
+                n_removed = len(dets) - n_kept
+                status = f'detected={len(dets)}  kept={n_kept}'
+                if n_removed:
+                    status += f'  removed={n_removed}'
+                status += '  L-click=remove  R-click=undo all  ENTER=confirm  q=quit'
                 if custom_msg:
-                    cv2.putText(vis, f'detected={len(dets)}', (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+                    cv2.putText(vis, status, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
                     y_offset = 55
                     for line in custom_msg:
                         cv2.putText(vis, line, (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
                         y_offset += 25
                 else:
-                    cv2.putText(vis,
-                                f'detected={len(dets)}  ENTER=confirm  s=shot  q=quit',
-                                (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                    cv2.putText(vis, status, (10, 25),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
                 cv2.imshow(win, vis)
                 k = cv2.waitKey(20) & 0xFF
                 if k in (ord('q'), 27):
                     cv2.destroyWindow(win)
                     cv2.waitKey(1)
                     return (None, None) if valid_keys else None
-                
+
                 if valid_keys:
                     char_k = chr(k) if 0 <= k < 256 else ''
                     if char_k in valid_keys:
@@ -913,14 +1010,19 @@ class CubeDetector:
                             cv2.imwrite(save_debug, vis)
                         cv2.destroyWindow(win)
                         cv2.waitKey(1)
-                        return dets, char_k
+                        kept = [d for d in dets if not d.get('user_excluded')]
+                        return kept, char_k
                 else:
                     if k in (13, 10, ord(' ')):
                         if save_debug:
                             cv2.imwrite(save_debug, vis)
                         cv2.destroyWindow(win)
                         cv2.waitKey(1)
-                        return dets
+                        kept = [d for d in dets if not d.get('user_excluded')]
+                        if n_removed:
+                            print(f'  preview 확정: {len(dets)}개 중 {n_removed}개 '
+                                  f'사용자 제거 → {len(kept)}개 사용')
+                        return kept
                         
                 if k == ord('s'):
                     out = save_debug or '/tmp/cubes_preview.png'
@@ -1164,13 +1266,16 @@ def gripper_set_width(robot, width_mm: float, settle=GRIPPER_SETTLE_SEC):
     return robot.gripper_set(pos, settle=settle, label=f'W{width_mm:.0f}mm')
 
 
-def gradual_gripper_release(robot, end_width_mm=None, n_steps=3, step_settle=0.08):
+def gradual_gripper_release(robot, end_width_mm=None, n_steps=3, step_settle=0.08,
+                             start_width_mm=None):
     """그리퍼를 N 단계로 점진적 open — close 상태에서 release_width 까지.
     "팍" 놓지 않고 cube 가 cell 표면에 부드럽게 안착하도록.
-    """
+    start_width_mm: close 시점 그리퍼 width (cube_w_mm 측정값). None 이면 CUBE_WIDTH_MM."""
     if end_width_mm is None:
         end_width_mm = RELEASE_WIDTH_MM
-    start_width = CUBE_WIDTH_MM   # close 후 finger 가 cube 옆에 닿은 상태
+    if start_width_mm is None:
+        start_width_mm = CUBE_WIDTH_MM
+    start_width = start_width_mm   # close 후 finger 가 cube 옆에 닿은 상태
     for i in range(1, n_steps + 1):
         width = start_width + (end_width_mm - start_width) * i / n_steps
         is_last = (i == n_steps)
@@ -1180,9 +1285,70 @@ def gradual_gripper_release(robot, end_width_mm=None, n_steps=3, step_settle=0.0
 
 
 
-def fast_gripper_close(robot):
-    """12번 gripper_close 는 settle=1.0 → 0.4 로 단축한 버전."""
-    return robot.gripper_set(p12.GRIP_CLOSE_POS, settle=GRIPPER_SETTLE_SEC, label='CLOSE')
+def fast_gripper_close(robot, cube_w_mm=None):
+    """cube_w_mm 측정값이 있으면 그 width 기반 close (finger 가 cube 옆 살짝 dig).
+    없거나 비정상이면 GRIP_CLOSE_POS=700 완전 닫힘 (cube 짓누름)."""
+    if cube_w_mm is not None and 20.0 <= cube_w_mm <= 40.0:
+        target_pos = width_mm_to_pos(cube_w_mm - GRIP_CLOSE_OVERSHOOT_MM)
+        label = f'CLOSE_w{cube_w_mm:.1f}mm'
+    else:
+        target_pos = p12.GRIP_CLOSE_POS
+        label = 'CLOSE_default'
+    return robot.gripper_set(target_pos, settle=GRIPPER_SETTLE_SEC, label=label)
+
+
+def _descend_cartesian_with_yaw_retry(robot, target_xyz, intermediate_xyz, base_rpy):
+    """Descend joint motion (이전엔 cartesian native). IK 실패 시 등가 yaw 로 재시도.
+
+    이전엔 Doosan native motion/move_line 으로 cartesian 직선 강하 → 컨트롤러 mix
+    (ros2_control ↔ Doosan native) 전환 정지가 사이클 stutter 의 주 원인. 80mm 짧은
+    descend 는 joint 보간 곡선이라도 옆 cube 안 침 → 컨트롤러 통일이 더 큰 이득.
+
+    cube 가 정사각형 (4-fold 회전 대칭) + 그리퍼 평행조 (180° 대칭) → yaw, yaw±90°,
+    yaw+180° 가 물리적으로 동일한 grasp. 원래 yaw 가 wrist singular / Doosan IK 한계로
+    실패해도 등가 yaw 로 풀리는 경우가 많음.
+
+    Returns: 최종 사용된 rpy_deg 리스트 (이후 close/lift 도 같은 yaw 써야 함).
+    """
+    try:
+        robot.move_line_base(target_xyz, rpy_deg=base_rpy)
+        return list(base_rpy)
+    except RuntimeError as e:
+        if 'Ikin' not in str(e):
+            raise
+        print(f'    [ik-debug] base yaw {base_rpy[2]:+.1f}° → {e}')
+    base_yaw = base_rpy[2]
+    # Doosan IK 의 current-pose continuity bias 때문에 base_yaw 자세 직후 ±90°/+180°
+    # 회전이 IK fail 하는 케이스가 있음. yaw=0 으로 wrist 를 한 번 align — place
+    # 단계에서 검증된 자세라 거의 항상 풀림. 이후 alt yaw 회전이 짧아짐.
+    try:
+        robot.move_line_base(intermediate_xyz,
+                             rpy_deg=[base_rpy[0], base_rpy[1], 0.0])
+        print(f'    [retry] wrist yaw=0° align 완료 → alt yaw 시도')
+    except RuntimeError as e_align:
+        if 'Ikin' not in str(e_align):
+            raise
+        print(f'    [ik-debug] yaw=0 align 도 실패 → {e_align}')
+    # 180° 우선 (j6 한 바퀴만 돌면 됨) → ±90° (cube 4-fold 대칭 활용).
+    for delta in (180.0, 90.0, -90.0):
+        alt_yaw = base_yaw + delta
+        alt_rpy = [base_rpy[0], base_rpy[1], alt_yaw]
+        print(f'    [retry] descend yaw {base_yaw:+.1f}° IK 실패 → 등가 yaw '
+              f'{alt_yaw:+.1f}° 재시도 (cube 4-fold / jaw 180° 대칭 활용)')
+        try:
+            robot.move_line_base(intermediate_xyz, rpy_deg=alt_rpy)
+            robot.move_line_base(target_xyz, rpy_deg=alt_rpy)
+            return alt_rpy
+        except RuntimeError as e2:
+            if 'Ikin' not in str(e2):
+                raise
+            print(f'    [ik-debug] alt yaw {alt_yaw:+.1f}° → {e2}')
+            continue
+    raise RuntimeError(
+        f'descend 실패: 원 yaw={base_yaw:+.1f}° 와 모든 등가 yaw (±90°/+180°) 도 IK '
+        f'실패. target={[round(v,1) for v in target_xyz]} 도달 불가 — 캘리브레이션/'
+        f'그리퍼 tcp_z_offset 확인.'
+    )
 
 
 def execute_one_cycle(robot, target, cell_xy, args):
@@ -1192,75 +1358,99 @@ def execute_one_cycle(robot, target, cell_xy, args):
     yaw = target.get('cube_yaw_deg')
     yaw_used = float(yaw) if yaw is not None else 0.0
     yaw_str = f'{yaw_used:+.1f}°' if yaw is not None else 'no-yaw(0°)'
+
+    # detect 가 측정한 cube 크기 (RGB+Depth+intrinsics). 비정상이면 default 25mm.
+    # 정사각형 cube 전제 — w/h ratio 가 0.75~1.33 밖이거나 한 변이 22~30mm 밖이면 부정확.
+    eff_w = target.get('cube_w_mm', CUBE_WIDTH_MM)
+    eff_h = target.get('cube_h_mm', CUBE_WIDTH_MM)
+    size_ok = (22.0 <= eff_w <= 30.0 and 22.0 <= eff_h <= 30.0
+               and 0.75 <= eff_w / max(eff_h, 1.0) <= 1.33)
+    if not size_ok:
+        print(f'  ! cube size 측정 부정확 ({eff_w:.1f}x{eff_h:.1f}) → default {CUBE_WIDTH_MM}')
+        eff_w = CUBE_WIDTH_MM
+        eff_h = CUBE_WIDTH_MM
     print(f'\n  >> cube @ ({bx:.1f}, {by:.1f}, {bz:.1f}) yaw={yaw_str} '
-          f'→ cell ({cell_xy[0]:.0f}, {cell_xy[1]:.0f})')
+          f'→ cell ({cell_xy[0]:.0f}, {cell_xy[1]:.0f})  size={eff_w:.1f}x{eff_h:.1f}mm')
 
     pick_rpy = [0.0, 180.0, yaw_used]                       # descent / lift 자세 = cube 변 정렬
     # 모든 cube 는 grid 에 yaw=0° 로 release — 다음 단계(탑쌓기 등) 가 axis-aligned 가정.
     place_rpy = [0.0, 180.0, 0.0]
 
     # cube 옆면 그립을 위해 cube 중심 z 로 내려감 (검출 z = cube 윗면 가정)
-    pick_z = bz - CUBE_WIDTH_MM / 2.0
+    # 사용자 요청: "cube 높이 /2 만큼" — eff_h 측정값 사용 (이전 fixed CUBE_WIDTH_MM)
+    pick_z = bz - eff_h / 2.0
     approach = [bx, by, pick_z + Z_APPROACH]
     pick = [bx, by, pick_z]
     lift = [bx, by, pick_z + Z_LIFT]
 
-    place = [cell_xy[0], cell_xy[1], pick_z]
+    # release 시 cube 바닥이 표면과 충돌하지 않게 z 를 RELEASE_LIFT_MM 만큼 올려서 떨어트림
+    place = [cell_xy[0], cell_xy[1], pick_z + RELEASE_LIFT_MM]
     place_app = [cell_xy[0], cell_xy[1], pick_z + Z_APPROACH]
 
     dur = MOVE_DURATION_SEC
     is_diagonal = bool(target.get('is_diagonal_grip', False))
-    pre_open_width = DIAG_PRE_OPEN_WIDTH_MM if is_diagonal else PRE_OPEN_WIDTH_MM
+    # 동적 pre_open = cube_w + clearance (이전 fixed PRE_OPEN_WIDTH_MM=40)
+    pre_open_width = (DIAG_PRE_OPEN_WIDTH_MM if is_diagonal
+                      else eff_w + PRE_OPEN_CLEARANCE_MM)
 
-    # ---- Pick approach (joint, 정지 없음) ----
-    # pre-open 그리퍼를 비동기로 발사 → motion 진행 중 동시에 열림.
-    # approach 는 joint 보간으로 빠르게 cube 위 80mm 까지.
+    # ---- Pick: approach + descend 한 trajectory 로 (multi-WP, 사이 정지 없음) ----
+    # 이전엔 approach 따로 + cartesian descend 따로 (컨트롤러 mix 정지). 모두 joint
+    # 으로 통일하고 multi-WP 로 묶어서 한 ros2_control trajectory 안에 처리.
+    # IK 실패 시 (예: descend 점 도달 불가) approach 만 가고 yaw retry 로 fallback.
     print('   [Pick]')
     print(f'    1) pre-open async ({pre_open_width:.0f}mm'
           f'{" — diagonal" if is_diagonal else ""}) + '
-          f'approach → {[round(v, 1) for v in approach]}')
+          f'approach→descend merged → {[round(v, 1) for v in pick]}')
     if not args.dry_run:
         robot.gripper_set(width_mm_to_pos(pre_open_width),
                           settle=0.0, label=f'PRE_OPEN_async_{pre_open_width:.0f}mm')
-        robot.move_line_base(approach, rpy_deg=pick_rpy, duration=dur)
+        try:
+            robot.move_line_base_multi_smooth([(approach, pick_rpy), (pick, pick_rpy)])
+        except RuntimeError as e:
+            if 'Ikin' not in str(e):
+                raise
+            print(f'    [merge-fallback] approach+descend IK fail → approach only + yaw retry')
+            robot.move_line_base(approach, rpy_deg=pick_rpy, duration=dur)
+            pick_rpy = _descend_cartesian_with_yaw_retry(robot, pick, approach, pick_rpy)
+        yaw_used = pick_rpy[2]
 
-    # 2) pick descend — 카르테시안 직선 80mm (옆 cube 안 치고 수직 강하)
-    print(f'    2) pick descend (cartesian, 직선 {Z_APPROACH:.0f}mm) → {[round(v, 1) for v in pick]}')
-    if not args.dry_run:
-        robot.move_line_cartesian(pick, rpy_deg=pick_rpy)
+    # 2) close (잡기) — cube_w_mm 동적 close
+    print(f'    2) close (잡기) — cube_w={eff_w:.1f}mm 기반')
+    if not args.dry_run: fast_gripper_close(robot, cube_w_mm=eff_w)
 
-    # 3) close (잡기)
-    print(f'    3) close (잡기)')
-    if not args.dry_run: fast_gripper_close(robot)
-
-    # ---- Transit (multi-WP, 한 trajectory action 으로 통과 — 정지 없음) ----
-    # cube 잡힌 위치 → lift → [yaw align] → place_app (target cell 위 80mm) 까지.
-    # place descend 는 분리 — 카르테시안 직선으로.
+    # ---- Transit + place descend: 한 trajectory 로 (multi-WP, 사이 정지 없음) ----
+    # 이전엔 transit (lift→align→place_app) 후 cartesian descend 분리. 이젠 place 까지
+    # multi-WP 에 포함해서 한 번에. IK 실패 시 transit 만 가고 yaw retry 로 fallback.
     transit = [(lift, pick_rpy)]
     if abs(yaw_used) > 0.5:
         transit.append((lift, place_rpy))          # 같은 XYZ 에서 yaw=0 align
-    transit.append((place_app, place_rpy))           # target cell 위 (descend 직전)
+    transit.append((place_app, place_rpy))           # target cell 위
+    transit_with_place = transit + [(place, place_rpy)]
     align_note = ' + align yaw→0' if abs(yaw_used) > 0.5 else ''
-    print(f'    4) transit (lift{align_note} → above cell) — {len(transit)} WP')
-    for wp, rp in transit:
+    print(f'    3) transit+place (lift{align_note} → cell → descend) — {len(transit_with_place)} WP')
+    for wp, rp in transit_with_place:
         print(f'       · {[round(v, 1) for v in wp]} rpy={[round(v,1) for v in rp]}')
     if not args.dry_run:
-        robot.move_line_base_multi_smooth(transit)
+        try:
+            robot.move_line_base_multi_smooth(transit_with_place)
+        except RuntimeError as e:
+            if 'Ikin' not in str(e):
+                raise
+            print(f'    [merge-fallback] transit+place IK fail → transit only + yaw retry')
+            robot.move_line_base_multi_smooth(transit)
+            place_rpy = _descend_cartesian_with_yaw_retry(robot, place, place_app, place_rpy)
 
-    # 5) place descend — 카르테시안 직선 80mm (옆 cell cube 와 부딪힘 회피)
-    print(f'    5) place descend (cartesian, 직선 {Z_APPROACH:.0f}mm) → {[round(v, 1) for v in place]}')
+    # ---- Place release + lift up ----
+    # multi-WP descend 의 마지막 WP 라 종점 도착 보장됨 → 추가 sleep 불필요.
+    # release 도 단발 — cube 25mm ↔ release 27mm 차이 2mm 라 점진 의미 약함.
+    # 동적 release width = cube_w + clearance (cube 옆에 살짝 벌려 떨어짐)
+    release_w = eff_w + RELEASE_CLEARANCE_MM
+    print(f'    4) release → {release_w:.1f}mm (cube_w {eff_w:.1f} + clearance)')
     if not args.dry_run:
-        robot.move_line_cartesian(place, rpy_deg=place_rpy)
+        gradual_gripper_release(robot, end_width_mm=release_w,
+                                start_width_mm=eff_w, n_steps=1)
 
-    # ---- Place 동기 + 점진 release + lift up ----
-    # 놓기 직전 짧은 동기 wait — descend 종점 settle.
-    # 그 후 gradual release — "팍" 놓지 말고 단계적으로 finger 열어서 cube 가 cell
-    # 표면에 부드럽게 안착 (점프/튕김 방지).
-    if not args.dry_run: time.sleep(0.15)
-    print(f'    6) gradual release → {RELEASE_WIDTH_MM:.0f}mm (3 steps)')
-    if not args.dry_run: gradual_gripper_release(robot, n_steps=3)
-
-    print(f'    7) lift up → {[round(v, 1) for v in place_app]}')
+    print(f'    5) lift up → {[round(v, 1) for v in place_app]}')
     if not args.dry_run:
         robot.move_line_base(place_app, rpy_deg=place_rpy, duration=dur)
 
@@ -1449,7 +1639,34 @@ def main():
             target_with_safe_yaw = {**target, 'cube_yaw_deg': safe_yaw,
                                      'is_diagonal_grip': is_diagonal}
             print(f'    cube #{cube_idx} → cell {mapping[cube_idx]} {target_cell}')
-            execute_one_cycle(robot, target_with_safe_yaw, target_cell, args)
+            try:
+                execute_one_cycle(robot, target_with_safe_yaw, target_cell, args)
+            except RuntimeError as exc:
+                # 한 cube IK/모션 실패 → 그 cube 만 skip, 다음 cube 진행. HOME 복귀 보장.
+                print(f'    !! cube #{cube_idx} 처리 실패 — skip 하고 계속: {exc}')
+                if not args.dry_run:
+                    # (a) Doosan firmware state 복구 — IK 실패 시 group=5 alarm 으로 SAFE_STOP
+                    # 등 비-STANDBY 상태에 빠질 수 있음. 명시적으로 복구해서 다음 cube 의
+                    # motion 명령이 silent reject 되지 않게 함.
+                    try:
+                        robot.recover_safety(verbose=False)
+                    except Exception as e_rec:
+                        print(f'    !! recover_safety 실패: {e_rec} — 무시하고 계속')
+                    # (b) IK 캐시 초기화 — 실패한 cube 에서 마지막 성공 sol_space 가 캐시에
+                    # 남아있으면 다음 cube IK 가 부적절한 분기를 우선 시도해서 실패율 ↑.
+                    robot._last_ik_sol = None
+                    # (c) 현재 위치에서 LIFT 높이로 안전 회피 (다음 cube approach 충돌 방지)
+                    try:
+                        bx_s, by_s, bz_s = target['base_xyz_mm']
+                        pick_z_s = bz_s - CUBE_WIDTH_MM / 2.0
+                        robot.move_line_base([bx_s, by_s, pick_z_s + Z_LIFT],
+                                              rpy_deg=[0.0, 180.0, 0.0],
+                                              duration=MOVE_DURATION_SEC)
+                    except Exception as e_safe:
+                        print(f'    !! 안전 lift 도 실패: {e_safe} — 그대로 진행')
+                used.add(cube_idx)            # 재시도 막기
+                in_progress.discard(cube_idx)
+                return                          # dets 업데이트 안 함 (cube 안 옮겨짐)
             old = dets[cube_idx]
             dets[cube_idx] = {
                 **old,

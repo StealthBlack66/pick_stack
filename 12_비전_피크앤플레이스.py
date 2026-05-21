@@ -87,16 +87,17 @@ HOME_JOINT_DEG = [0.0, 0.0, 90.0, 0.0, 90.0, 0.0]   # 안전한 시작 자세 (d
 TOP_DOWN_RPY_DEG = [0.0, 180.0, 0.0]                # 그리퍼가 -Z(아래) 향하는 자세 (deg)
 
 # 모션 시간 (FollowJointTrajectory: time_from_start)
-# 짧을수록 빠름·거칠어짐. status=6 retry + goal_time_tolerance=2s + change_operation_speed=100
-# 위에서 1.5 까지 단축 시도. 만약 path tolerance abort 자주 발생하면 다시 2.0 / 2.5 로.
-MOVE_DURATION_SEC = 1.5
+# 1.5 는 ramp 부족으로 일자/거침 — 3.0 으로 복원해서 trapezoidal 가속/감속 시간 확보.
+# 이전 5.0 → 단축. status=6 path tolerance abort 자주 발생하면 4.0 / 5.0 으로 복원.
+MOVE_DURATION_SEC = 3.0
 JOINT_NAMES = ['joint_1', 'joint_2', 'joint_3', 'joint_4', 'joint_5', 'joint_6']
 
-# Doosan native motion (move_spline_task / move_line) 의 vel/acc.
-# vel=[mm/s, deg/s], acc=[mm/s², deg/s²]. 처음엔 보수적으로 시작 → 안정 확인 후 키울 것.
-# 너무 공격적 (250/100, 500/200) 이면 move_spline_task success=False 반환 가능.
+# Doosan native motion (move_line) 의 vel/acc — cartesian descend.
+# vel=[mm/s, deg/s], acc=[mm/s², deg/s²]. 절반 (75/30, 250/75) 으로 낮췄더니 descend
+# 자체가 시작 안 되는 증상 → 원래 값으로 복원. joint motion 부드러움은 MOVE_DURATION_SEC
+# 으로 따로 제어됨 (cartesian 에는 영향 없음).
 NATIVE_VEL = [150.0, 60.0]
-NATIVE_ACC = [300.0, 120.0]
+NATIVE_ACC = [500.0, 150.0]
 # 시작 시 한 번 세팅
 COLLISION_SENSITIVITY = 30   # 0~100. 기본 50 보다 낮춰서 trapezoidal 시작 spike 오인 방지.
 OPERATION_SPEED = 100        # 1~100 전역 속도 배율. native vel/acc 와 곱셈으로 적용.
@@ -735,7 +736,7 @@ class PickAndPlace(Node):
         for jn in JOINT_NAMES:
             pt_tol = JointTolerance()
             pt_tol.name = jn
-            pt_tol.position = 0.25
+            pt_tol.position = 1.0    # 0.5 → 1.0 (J4 가 0.5 rad 도 빈번 위반 — 사실상 endpoint check 모드)
             goal.path_tolerance.append(pt_tol)
             g_tol = JointTolerance()
             g_tol.name = jn
@@ -751,19 +752,24 @@ class PickAndPlace(Node):
         if gh is None or not gh.accepted:
             raise RuntimeError('Trajectory 골이 거부됨 (Servo OFF / 한계 초과 가능)')
 
+        self._current_gh = gh   # 's' 키 cancel 용 공유 핸들
         result_fut = gh.get_result_async()
         rclpy.spin_until_future_complete(self, result_fut, timeout_sec=duration + 30.0)
+        self._current_gh = None
         status = result_fut.result().status
-        if status == 6:
-            # 일시적 controller race — 300ms 대기 후 1회 재전송
-            time.sleep(0.3)
+        # 일시적 controller race — sleep 후 재전송. 1회 → 3회 (실 e0509 stutter 회복용).
+        for retry in range(3):
+            if status != 6:
+                break
+            time.sleep(0.5)
             send_fut = self.traj_action.send_goal_async(goal)
             rclpy.spin_until_future_complete(self, send_fut, timeout_sec=10.0)
             gh = send_fut.result()
-            if gh is not None and gh.accepted:
-                result_fut = gh.get_result_async()
-                rclpy.spin_until_future_complete(self, result_fut, timeout_sec=duration + 30.0)
-                status = result_fut.result().status
+            if gh is None or not gh.accepted:
+                continue
+            result_fut = gh.get_result_async()
+            rclpy.spin_until_future_complete(self, result_fut, timeout_sec=duration + 30.0)
+            status = result_fut.result().status
         if status != 4:   # GoalStatus.STATUS_SUCCEEDED
             raise RuntimeError(f'Trajectory 실행 실패 (status={status})')
 
@@ -835,7 +841,7 @@ class PickAndPlace(Node):
         for jn in JOINT_NAMES:
             pt_tol = JointTolerance()
             pt_tol.name = jn
-            pt_tol.position = 0.25
+            pt_tol.position = 1.0    # 0.5 → 1.0 (J4 가 0.5 rad 도 빈번 위반 — 사실상 endpoint check 모드)
             goal.path_tolerance.append(pt_tol)
             g_tol = JointTolerance()
             g_tol.name = jn
@@ -853,15 +859,19 @@ class PickAndPlace(Node):
         result_fut = gh.get_result_async()
         rclpy.spin_until_future_complete(self, result_fut, timeout_sec=t + 30.0)
         status = result_fut.result().status
-        if status == 6:
-            time.sleep(0.3)
+        # 1회 → 3회 retry (실 e0509 multi-WP stutter 회복용)
+        for retry in range(3):
+            if status != 6:
+                break
+            time.sleep(0.5)
             send_fut = self.traj_action.send_goal_async(goal)
             rclpy.spin_until_future_complete(self, send_fut, timeout_sec=10.0)
             gh = send_fut.result()
-            if gh is not None and gh.accepted:
-                result_fut = gh.get_result_async()
-                rclpy.spin_until_future_complete(self, result_fut, timeout_sec=t + 30.0)
-                status = result_fut.result().status
+            if gh is None or not gh.accepted:
+                continue
+            result_fut = gh.get_result_async()
+            rclpy.spin_until_future_complete(self, result_fut, timeout_sec=t + 30.0)
+            status = result_fut.result().status
         if status != 4:
             raise RuntimeError(f'Multi-WP Trajectory 실패 (status={status})')
 
@@ -920,9 +930,9 @@ class PickAndPlace(Node):
         if rpy_deg is None:
             rpy_deg = self.top_down_rpy
         if vel is None:
-            vel = [150.0, 60.0]
+            vel = list(NATIVE_VEL)
         if acc is None:
-            acc = [500.0, 150.0]
+            acc = list(NATIVE_ACC)
         x, y, z_user = xyz_mm
         z = z_user + self.tcp_z_offset
 
@@ -947,14 +957,16 @@ class PickAndPlace(Node):
         req.mode = 0         # ABSOLUTE
         req.blend_type = 0   # BLENDING_SPEED_TYPE_DUPLICATE
         req.sync_type = 0    # SYNC (blocking)
-        r = self._call(self.cli_move_line, req, timeout=30.0)
+        # sync_type=0 이라 service 는 motion 종료까지 block. 80mm 강하 (vel=150, acc=500)
+        # 면 ~1.5s + 펌웨어 오버헤드. timeout=30.0 이었던 게 사용자에게 "강하 안 함 / hang"
+        # 으로 보임 → 5.0 으로 단축. 실제 cartesian 이 5초 넘는 경우는 거의 없음.
+        r = self._call(self.cli_move_line, req, timeout=5.0)
         if not (r and r.success):
             # cartesian 직선 fail 원인: task-space 직선 보간이 wrist singular / joint
-            # limit 통과 시 IK 가 중간점에서 fail. 이 경우 joint trajectory 로 fallback
-            # (cartesian 직선 보장 X, joint space 곡선이지만 거리 짧으면 충분히 직선
-            # 비슷). 단발 cube descend (~80mm) 정도면 옆 cube 안 침.
-            print(f'    [motion] move_line cartesian fail '
-                  f'(yaw={rpy_deg[2]:+.0f}° wrist singular 의심) → joint fallback')
+            # limit 통과 시 IK 가 중간점에서 fail. 이 경우 joint trajectory 로 fallback.
+            reason = 'no-response/timeout' if r is None else 'success=False'
+            print(f'    [motion] move_line cartesian fail ({reason}, '
+                  f'yaw={rpy_deg[2]:+.0f}° wrist singular 의심) → joint fallback')
             self.move_line_base(xyz_mm, rpy_deg=rpy_deg,
                                 duration=MOVE_DURATION_SEC)
 

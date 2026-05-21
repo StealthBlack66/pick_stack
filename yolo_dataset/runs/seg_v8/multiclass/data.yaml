@@ -1,0 +1,7 @@
+# 18-class angle classification (5deg bins, cube 90deg symmetry)
+path: /home/fastcampus/Downloads/test/로봇강의_예제/02_Doosan_Robot_제어/yolo_dataset/runs/seg_v8/multiclass
+train: images/train
+val: images/val
+
+nc: 18
+names: ['0-5', '5-10', '10-15', '15-20', '20-25', '25-30', '30-35', '35-40', '40-45', '45-50', '50-55', '55-60', '60-65', '65-70', '70-75', '75-80', '80-85', '85-90']
