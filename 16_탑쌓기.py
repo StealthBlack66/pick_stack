@@ -21,6 +21,7 @@ import importlib.util
 import math
 import os
 import sys
+import time
 
 import numpy as np
 import rclpy
@@ -65,20 +66,26 @@ SAFE_TRAVEL_Z_ABOVE_TABLE = 250.0
 # ===== Tower Pick & Place =====
 def execute_stack_pick_place(robot, source_xyz_mm, source_yaw_deg,
                               target_center_xyz_mm, target_yaw_deg, args,
-                              z_table_top, pre_open_width_mm=None):
+                              z_table_top, pre_open_width_mm=None,
+                              duration_sec=None, descend_duration_sec=None,
+                              source_tcp_z_mm=None):
     """source (cube top z) 에서 잡아 target (cube 중심 z) 에 놓기.
     모든 cube 간 이동은 safe-z 위에서 → 탑 / 다른 cube 충돌 회피.
     source_yaw / target_yaw 가 다르면 source 위 safe-z 에서 회전 (cube 양축 정렬용).
 
-    pre_open_width_mm: pick descent 전에 그리퍼 벌릴 폭(mm). None → p15.PRE_OPEN_WIDTH_MM 기본값.
+    pre_open_width_mm: pick descent 전 그리퍼 벌릴 폭(mm). None → p15.GRIPPER_OPEN_WIDTH_MM.
+    duration_sec: 일반 모션 segment 시간. None → p15.MOVE_DURATION_SEC.
+    descend_duration_sec: pick/place 강하 segment 시간 (느림, 정밀). None → duration_sec 와 동일.
+    source_tcp_z_mm: pick 시 TCP 의 절대 z (mm). None → sz - CUBE_WIDTH/2 (옛 방식).
+                     예: 15번 셋업 (모든 cube 같은 높이) 면 p15.PICK_Z 전달.
     """
     if pre_open_width_mm is None:
-        pre_open_width_mm = p15.PRE_OPEN_WIDTH_MM
+        pre_open_width_mm = p15.GRIPPER_OPEN_WIDTH_MM
     sx, sy, sz = source_xyz_mm
     tx, ty, tz_center = target_center_xyz_mm
     safe_z = z_table_top + SAFE_TRAVEL_Z_ABOVE_TABLE
 
-    pick_z = sz - p15.CUBE_WIDTH_MM / 2.0   # cube 중심 z (TCP 기준)
+    pick_z = source_tcp_z_mm if source_tcp_z_mm is not None else (sz - p15.CUBE_WIDTH_MM / 2.0)
     pick_rpy = [0.0, 180.0, source_yaw_deg]
     place_rpy = [0.0, 180.0, target_yaw_deg]
 
@@ -91,7 +98,8 @@ def execute_stack_pick_place(robot, source_xyz_mm, source_yaw_deg,
     place = [tx, ty, tz_center]
     transit_after_safe = [tx, ty, safe_z]
 
-    dur = p15.MOVE_DURATION_SEC
+    dur = duration_sec if duration_sec is not None else p15.MOVE_DURATION_SEC
+    desc_dur = descend_duration_sec if descend_duration_sec is not None else dur
 
     # Group A: transit_src_safe → approach (그리퍼 동작 없는 구간 묶기 → 정지 없음)
     print(f'   [Group A] transit over source → approach @ safe z={safe_z:.0f} yaw={source_yaw_deg:+.0f}°')
@@ -105,31 +113,38 @@ def execute_stack_pick_place(robot, source_xyz_mm, source_yaw_deg,
     print(f'    pre-open {pre_open_width_mm:.0f}mm')
     if not args.dry_run: p15.gripper_set_width(robot, pre_open_width_mm)
 
-    # Group B: descend only (single segment, no group)
+    # Group B: descend only (single segment, no group). 강하는 정밀 위해 desc_dur 사용.
     print(f'    descend {[round(v, 1) for v in pick]}')
-    if not args.dry_run: robot.move_line_base(pick, rpy_deg=pick_rpy, duration=dur)
+    if not args.dry_run: robot.move_line_base(pick, rpy_deg=pick_rpy, duration=desc_dur)
 
-    # Gripper close
-    print(f'    close')
-    if not args.dry_run: p15.fast_gripper_close(robot)
-
-    # Group C: lift → [rotate] → transit_tgt_safe → place_app → place (5 waypoints, 끊김 없음)
-    print(f'   [Group C] lift → transit → place')
-    motion_C = [(transit_lift_safe, pick_rpy)]
-    if abs(source_yaw_deg - target_yaw_deg) > 0.5:
-        # 같은 XYZ 에서 yaw 만 회전
-        motion_C.append((transit_lift_safe, place_rpy))
-    motion_C.append((transit_tgt_safe, place_rpy))
-    motion_C.append((place_app, place_rpy))
-    motion_C.append((place, place_rpy))
+    # Gripper close — 15번 패턴: half-close (자가정렬) → 완전 close + 1.0s settle
+    print(f'    close: half ({p15.HALF_CLOSE_WIDTH_MM:.0f}mm) → 자가정렬 → 완전 닫음 + 1.0s settle')
     if not args.dry_run:
-        robot.move_line_base_multi(motion_C, [dur] * len(motion_C))
+        p15.gripper_set_width(robot, p15.HALF_CLOSE_WIDTH_MM, settle=p15.HALF_CLOSE_SETTLE_SEC)
+        robot.gripper_set(p12.GRIP_CLOSE_POS, settle=1.0, label='CLOSE')
 
-    # Gripper open
-    print(f'    open {p15.RELEASE_WIDTH_MM:.0f}mm (release)')
-    if not args.dry_run: p15.gripper_set_width(robot, p15.RELEASE_WIDTH_MM)
+    # Transit (multi, place_app 위까지만) — 15번 패턴, blend 로 인한 사선 방지 위해 place 제외
+    print(f'   [transit] lift → transit → place_app')
+    transit_wps = [(transit_lift_safe, pick_rpy)]
+    if abs(source_yaw_deg - target_yaw_deg) > 0.5:
+        transit_wps.append((transit_lift_safe, place_rpy))   # 같은 XYZ 에서 yaw 만 회전
+    transit_wps.append((transit_tgt_safe, place_rpy))
+    transit_wps.append((place_app, place_rpy))
+    if not args.dry_run:
+        robot.move_line_base_multi(transit_wps, [dur] * len(transit_wps))
 
-    # Group D: lift after (single)
+    # Place descend (단발 cartesian) — 수직 강하 보장 + desc_dur 로 안전 속도
+    print(f'    place descend (수직) → {[round(v, 1) for v in place]}')
+    if not args.dry_run:
+        robot.move_line_base(place, rpy_deg=place_rpy, duration=desc_dur)
+
+    # Gripper open + 0.5초 대기 — 15번 패턴 (cube 안착 시간)
+    print(f'    open {p15.RELEASE_OPEN_WIDTH_MM:.0f}mm (release) + 0.5s 대기')
+    if not args.dry_run:
+        p15.gripper_set_width(robot, p15.RELEASE_OPEN_WIDTH_MM)
+        time.sleep(0.5)
+
+    # Lift after (single)
     print(f'    lift to safe z {[round(v, 1) for v in transit_after_safe]}')
     if not args.dry_run:
         robot.move_line_base(transit_after_safe, rpy_deg=place_rpy, duration=dur)

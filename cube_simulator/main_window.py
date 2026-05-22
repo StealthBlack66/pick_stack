@@ -192,6 +192,12 @@ class CubeSimulatorMainWindow(QMainWindow):
         btn_iso = QPushButton('Iso')
         btn_iso.clicked.connect(self._view.iso_view)
         h4.addWidget(btn_iso)
+        # 360° 자동 회전 토글 — 카메라 yaw 가 일정 속도 회전 (12s/회전)
+        btn_spin = QPushButton('360° 회전')
+        btn_spin.setCheckable(True)
+        btn_spin.setToolTip('체크하면 카메라가 워크피스 주위를 일정 속도로 회전 (보기 전용)')
+        btn_spin.toggled.connect(self._view.toggle_auto_rotate)
+        h4.addWidget(btn_spin)
         v.addLayout(h4)
 
         h5 = QHBoxLayout()

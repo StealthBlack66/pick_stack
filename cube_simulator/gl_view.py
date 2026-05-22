@@ -15,7 +15,7 @@ from __future__ import annotations
 import math
 import numpy as np
 
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtWidgets import QOpenGLWidget
 
 from . import gl_primitives as glp
@@ -198,6 +198,44 @@ class Cube3DView(QOpenGLWidget):
         self._cam_yaw_deg = 45.0
         self._cam_pitch_deg = 55.0
         self.update()
+
+    # --- 자동 회전 (360° 뷰) -------------------------------------------------
+    # 카메라 yaw 만 일정 속도로 증가 → 워크피스 주위를 한 바퀴 돌면서 관찰.
+    # 마우스로 카메라 조작은 그대로 동작 (드래그하면 회전 잠시 멈춤 효과 없이
+    # 사용자 입력이 그대로 반영됨 — 다음 timer tick 부터 다시 yaw 증가).
+    def _ensure_rotate_timer(self) -> None:
+        if getattr(self, '_rotate_timer', None) is None:
+            self._rotate_timer = QTimer(self)
+            self._rotate_timer.timeout.connect(self._on_rotate_tick)
+            self._rotate_deg_per_sec = 30.0    # 12 초에 한 바퀴
+            self._rotate_interval_ms = 33      # ≈30 FPS
+
+    def _on_rotate_tick(self) -> None:
+        step = self._rotate_deg_per_sec * (self._rotate_interval_ms / 1000.0)
+        self._cam_yaw_deg = (self._cam_yaw_deg + step) % 360.0
+        self.update()
+
+    def start_auto_rotate(self, deg_per_sec: float = 30.0) -> None:
+        """카메라를 yaw 방향으로 일정 속도 회전 시작 (기본 30°/sec = 12s/회전)."""
+        self._ensure_rotate_timer()
+        self._rotate_deg_per_sec = float(deg_per_sec)
+        if not self._rotate_timer.isActive():
+            self._rotate_timer.start(self._rotate_interval_ms)
+
+    def stop_auto_rotate(self) -> None:
+        if getattr(self, '_rotate_timer', None) is not None and self._rotate_timer.isActive():
+            self._rotate_timer.stop()
+
+    def toggle_auto_rotate(self, on: bool) -> None:
+        """QPushButton(checkable=True).toggled 신호에 직접 연결 가능."""
+        if on:
+            self.start_auto_rotate()
+        else:
+            self.stop_auto_rotate()
+
+    def set_auto_rotate_speed(self, deg_per_sec: float) -> None:
+        self._ensure_rotate_timer()
+        self._rotate_deg_per_sec = float(deg_per_sec)
 
     # --- QOpenGLWidget --------------------------------------------------------
     def initializeGL(self) -> None:

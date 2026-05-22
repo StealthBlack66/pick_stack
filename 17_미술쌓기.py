@@ -176,6 +176,7 @@ ART_PITCH_MM = p15.CUBE_WIDTH_MM + 2.0
 # 모양별 pitch 오버라이드 — diamond_pyramid 는 대각선 안착이라 지지 면적 최대화 위해 1mm 여유로
 SHAPE_PITCH_MM = {
     'diamond_pyramid': p15.CUBE_WIDTH_MM + 1.0,  # 26mm — layer1 cube 의 corner-corner overlap 12mm 확보
+    'hexagon_6': p15.CUBE_WIDTH_MM + 3.0,        # 28mm — 옆 cube 충돌 회피 (마진 +1mm)
 }
 
 # place yaw — row 충돌 회피 위해 90° (16번 Tower2 와 동일 논리)
@@ -187,6 +188,10 @@ ART_PICK_YAW = 90.0
 
 # pick 전 그리퍼 벌리는 폭 — 미술쌓기는 40mm 로 고정 (cube 25mm + 양옆 7.5mm 여유).
 ART_PRE_OPEN_WIDTH_MM = 40.0
+
+# 17번 자체 속도 (15번보다 느림 — 탑 쌓기는 정밀 + 안전 우선).
+STACK_MOVE_DURATION_SEC = 3.0       # 일반 모션 (transit/lift 등)
+STACK_DESCEND_DURATION_SEC = 4.0    # 강하 (pick / place descend — 안전 우선)
 
 
 def build_art(robot, dets, shape_name, args):
@@ -262,14 +267,17 @@ def build_art(robot, dets, shape_name, args):
         cell_idx = matched_cell_indices[order_idx]
         cx, cy = grid_cells[cell_idx]             # ← 실제 매칭된 그리드 셀 좌표로 pick
         drift_mm = math.hypot(cx - cx_det, cy - cy_det)
-        src = (cx, cy, sample_z)
+        # 절대 z 사용 — 15번 셋업 (모든 cube 동일 25mm, 바닥 z=-30, PICK_Z=-13) 가정.
+        # 잡은 높이(PICK_Z) 와 layer 0 놓는 높이가 일치 — 같은 바닥 위 정렬 + 쌓기.
+        src = (cx, cy, p15.PICK_Z)
         # 인접 cell 에 cube 가 남아있으면 finger 충돌 피하는 방향 자동 선택
         pick_yaw = p15.pick_yaw_for_grid_cell(order_idx, cell_positions, ART_PICK_YAW, used_cells)
         target_x = SHAPE_BASE_XY[0] + gx * pitch
         target_y = SHAPE_BASE_XY[1] + gy * pitch
-        # [핵심] 1층(Layer 0)은 비전으로 측정한 큐브 중심 높이(sample_z)와 동일한 높이로 내려놓습니다.
-        # 기존에는 테이블 기준(z_table_top)으로 다시 계산하여 실제 잡은 높이보다 낮게(테이블 안으로) 내려가려던 문제를 해결했습니다.
-        target_center_z = sample_z + layer * p15.CUBE_WIDTH_MM
+        # 바닥면 (PICK_Z = 바닥 + 17mm) 기준 layer 별 z. 다층이면 cube 높이만큼 ↑.
+        # layer 0: PICK_Z (잡은 z 와 동일 — 같은 바닥면)
+        # layer N: PICK_Z + N * CUBE_WIDTH_MM
+        target_center_z = p15.PICK_Z + layer * p15.CUBE_WIDTH_MM
         target = (target_x, target_y, target_center_z)
         print(f'\n[{order_idx + 1}/{need}] layer{layer} grid({gx:+.1f},{gy:+.1f}) → '
               f'mm({target_x:.0f},{target_y:.0f},z={target_center_z:.0f})  '
@@ -277,7 +285,10 @@ def build_art(robot, dets, shape_name, args):
               f'[det({cx_det:.0f},{cy_det:.0f}) Δ={drift_mm:.0f}mm]')
         p16.execute_stack_pick_place(
             robot, src, pick_yaw, target, yaw,
-            args, z_table_top=z_table_top, pre_open_width_mm=ART_PRE_OPEN_WIDTH_MM)
+            args, z_table_top=z_table_top, pre_open_width_mm=ART_PRE_OPEN_WIDTH_MM,
+            duration_sec=STACK_MOVE_DURATION_SEC,
+            descend_duration_sec=STACK_DESCEND_DURATION_SEC,
+            source_tcp_z_mm=p15.PICK_Z)
         used_cells.add(order_idx)
 
     print(f'\n=== "{shape_name}" 조립 완료 ===')
@@ -339,18 +350,21 @@ def build_multi_stack(robot, dets, args):
     def _pick_one(idx, place_xyz, place_yaw):
         cell_idx = matched_cell_indices[idx]
         x, y = grid_cells[cell_idx]
-        src = (x, y, sample_z)
+        src = (x, y, p15.PICK_Z)   # 절대 z (15번 셋업)
         pick_yaw = p15.pick_yaw_for_grid_cell(idx, cell_positions, ART_PICK_YAW, used_cells)
         p16.execute_stack_pick_place(robot, src, pick_yaw, place_xyz, place_yaw,
                                      args, z_table_top=z_table_top,
-                                     pre_open_width_mm=ART_PRE_OPEN_WIDTH_MM)
+                                     pre_open_width_mm=ART_PRE_OPEN_WIDTH_MM,
+                                     duration_sec=STACK_MOVE_DURATION_SEC,
+                                     descend_duration_sec=STACK_DESCEND_DURATION_SEC,
+                                     source_tcp_z_mm=p15.PICK_Z)
         used_cells.add(idx)
 
     cube_idx = 0
 
     for layer in range(3):
-        # 층마다 교차 쌓기 (Interleaved: 0,2층은 왼쪽 2블럭+우측 1블럭 / 1층은 왼쪽 1블럭+우측 2블럭)
-        target_z = z_table_top + p15.CUBE_WIDTH_MM / 2.0 + p15.CUBE_WIDTH_MM * layer
+        # 바닥면 (PICK_Z) 기준 layer 별 z. layer 0 = PICK_Z, layer N = PICK_Z + N*CUBE_WIDTH.
+        target_z = p15.PICK_Z + layer * p15.CUBE_WIDTH_MM
 
         if layer % 2 == 0:
             # 1. 가조립 2-block (left & mid)

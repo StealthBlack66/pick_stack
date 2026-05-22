@@ -22,6 +22,7 @@ import importlib.util
 import math
 import os
 import sys
+import time
 from pathlib import Path
 
 import cv2
@@ -84,38 +85,57 @@ TRACK_STALE_FRAMES = 10       # 이만큼 안 보이면 트랙 삭제
 
 # 그리퍼
 CUBE_WIDTH_MM = 25.0
-PRE_OPEN_WIDTH_MM = 40.0
-RELEASE_WIDTH_MM = 27.0
-# detect 가 측정한 cube width 기반 동적 그리퍼 폭 계산용 clearance.
-# pre_open = cube_w_mm + PRE_OPEN_CLEARANCE_MM (descend 중 cube 안 치게 여유)
-# release  = cube_w_mm + RELEASE_CLEARANCE_MM  (살짝만 벌려서 부드럽게 안착)
-# close    = cube_w_mm - GRIP_CLOSE_OVERSHOOT_MM (finger 가 cube 옆에 살짝 dig)
-PRE_OPEN_CLEARANCE_MM = 15.0
-RELEASE_CLEARANCE_MM = 2.0
-GRIP_CLOSE_OVERSHOOT_MM = 2.0   # cube_w 보다 2mm 더 닫음 — finger 가 cube 강하게 잡음
+# pre-open 폭 (잡기 전 descend 중 cube 안 치게). cube 25mm + 대각 35.4mm 둘 다 안 닿게 45mm.
+GRIPPER_OPEN_WIDTH_MM = 45.0
+# release 폭 (놓을 때 살짝만 벌려서 부드럽게 안착). cube 25mm + 10mm 마진.
+RELEASE_OPEN_WIDTH_MM = 35.0
+# Half-close 폭 (자가정렬용). cube 옆면에 살짝 닿아 회전 토크 발생, 코너 잡기 회피.
+# cube 25mm + 3mm 여유. half-close 후 HALF_CLOSE_SETTLE_SEC 대기 → cube 자가 회전 시간.
+HALF_CLOSE_WIDTH_MM = 28.0
+HALF_CLOSE_SETTLE_SEC = 0.3
+# Wiggle (yaw 회전) — half-close 후 그리퍼 yaw 를 ±N° 흔들어서 cube 강제 회전 정렬.
+# finger 가 cube 옆면 살짝 잡은 상태에서 회전 → cube 가 따라 회전 → 옆면 평행 정렬.
+WIGGLE_YAW_DEG = 10.0
+WIGGLE_DURATION_SEC = 0.5
 GRIP_RANGE_MM = 130.0    # RH-P12-RN-A 완전 열림(POS 0)에서 약 130mm 추정
-# 대각 잡기 (45°/135° yaw — cube 코너에 finger 가 닿음) 시 pre-open 폭.
-# cube 대각 = 25 × √2 ≈ 35.4mm. finger 가 cube 옆에 안 닿게 마진 포함해서 50mm.
-DIAG_PRE_OPEN_WIDTH_MM = 50.0
 
 # 0° snap 보정 — 학습 라벨이 axis-aligned 라 검출 yaw 가 0° 부근으로 collapse 함.
 # 실제 흩뿌려진 cube 는 거의 0° 가 아니므로, 검출이 0° 근처면 작은 회전 부여.
-YAW_NEAR_ZERO_THR_DEG = 15.0     # |yaw| 이값 이내면 "0° 로 잘못 snap" 으로 간주 (자주 발동)
-YAW_NEAR_ZERO_BIAS_DEG = 15.0    # 위 경우에 사용할 회전량 (부호는 첫 두 변 중 finger clearance 좋은 쪽)
+YAW_NEAR_ZERO_THR_DEG = 10.0     # |yaw| 이값 이내면 "0° 로 잘못 snap" 으로 간주
+YAW_NEAR_ZERO_BIAS_DEG = 22.5    # 위 경우에 사용할 회전량 (부호는 첫 두 변 중 finger clearance 좋은 쪽)
 
 
 # 모션
 Z_APPROACH = 80.0
 Z_LIFT = 100.0
-# Release 시 cube 가 표면에 충돌하지 않게 z 올려서 떨어트림.
-# place_z = pick_z + RELEASE_LIFT_MM. cube 25mm 라 +5mm 면 cube 바닥이 표면 +5mm 위.
-RELEASE_LIFT_MM = 5.0
+# 사용자 셋업: 바닥 = robot base origin 기준 z=-30mm.
+FLOOR_Z = -30.0
+# pick/place 시 TCP 의 절대 z = 바닥 위 N mm. 검출 cube 윗면(bz) 과 무관.
+# 모든 cube 가 바닥에 안착해 있으므로 일정 절대 높이에서 잡고 놓음.
+PICK_HEIGHT_ABOVE_FLOOR_MM = 17.0
+PICK_Z = FLOOR_Z + PICK_HEIGHT_ABOVE_FLOOR_MM   # = -13.0
 
-# 한 segment 이동 시간. 사용자 요청 "속도 느리게" → 5.0 으로 늘림 (부드럽고 천천히).
-# 너무 길면 답답함 ↔ 너무 짧으면 일자 느낌. 4.0 ~ 5.0 사이가 보통 적정.
-MOVE_DURATION_SEC = 5.0
+# Place 강하 시작 z (바닥 위 N mm). place_app → place 가 같은 X,Y 라 수직 일직선 강하.
+PLACE_APP_HEIGHT_ABOVE_FLOOR_MM = 80.0
+PLACE_APP_Z = FLOOR_Z + PLACE_APP_HEIGHT_ABOVE_FLOOR_MM   # = +50.0
+
+# 시차 보정 — detect center 를 이미지 v 방향으로 N 픽셀 위로 옮긴 후 base 재투영.
+# 카메라가 완전 top-down 이 아니라 살짝 비스듬해서 mask 가 전체적으로 아래쪽으로 치우치는
+# 현상 보정. 0 이면 보정 없음. 큐브 거리/카메라 각도에 따라 튜닝.
+CENTER_UP_PIXEL = 3
+
+# 일반 모션 segment 이동 시간 (빠름). transit/HOME 등.
+MOVE_DURATION_SEC = 1.5
+# 잡기/놓기 직전 강하 (느림, 정밀). pick descend + place descend + yaw_retry descend.
+DESCEND_DURATION_SEC = 2.5
 # 그리퍼 settle — RH-P12-RN-A 작은 변화는 0.1s 면 충분 (close 안정성 모니터 후 조정).
 GRIPPER_SETTLE_SEC = 0.1
+
+# 15번 자체 작업영역 — 12번 기본값 (-600~600) 보다 사용자 셋업이 클 경우 override.
+# 두산 e0509 reach ≈ 920mm 이므로 X 한계는 그 이하로.
+WORK_X = (-1000.0, 1000.0)
+WORK_Y = (-1000.0, 1000.0)
+WORK_Z = (-150.0, 600.0)
 
 
 def width_mm_to_pos(width_mm: float) -> int:
@@ -123,6 +143,8 @@ def width_mm_to_pos(width_mm: float) -> int:
     width = max(0.0, min(GRIP_RANGE_MM, width_mm))
     pos = 700.0 * (1.0 - width / GRIP_RANGE_MM)
     return int(round(pos))
+
+
 
 
 # ===== Vision (YOLO 객체 인식만) =====
@@ -422,7 +444,15 @@ class CubeDetector:
         # 윗면 가장자리에서 옆면으로 꺾이는 경계선 노이즈를 깎아냄 (아래쪽 쏠림 방지)
         k_erode = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
         mask_local = cv2.erode(mask_local, k_erode, iterations=1)
-        
+
+        # 가장 큰 connected component 만 유지 — 옆면 fragment, 인접 큐브 잔여 mask 제거.
+        # 이게 없으면 minAreaRect 가 본체 + fragment 를 모두 감싸 중심이 크게 이동 ("사선 이동").
+        n_lbl, labels = cv2.connectedComponents(mask_local)
+        if n_lbl > 2:                                    # 1=배경, 2+ = 여러 덩어리
+            sizes = [(labels == i).sum() for i in range(1, n_lbl)]
+            largest = int(np.argmax(sizes)) + 1
+            mask_local = (labels == largest).astype(np.uint8) * 255
+
         ys_local, xs_local = np.where(mask_local > 0)
         if len(ys_local) < 20: return None
 
@@ -443,84 +473,42 @@ class CubeDetector:
         if len(base_pts) < 20: return None
         base_pts = np.array(base_pts, dtype=np.float32)
         
-        # RealSense 카메라의 고질적인 시차(Parallax) 및 Depth 그림자 현상으로 인해
-        # 깊이 마스크가 실제 시각적 윗면보다 항상 '아래쪽(+V 방향)'으로 치우치는 현상 보정
-        
-        # 1. 일단 2D 이미지 상에서의 무게중심 픽셀(u, v)을 구함
-        u_mean = int(np.mean(xs_local) + x1)
-        v_mean = int(np.mean(ys_local) + y1)
-        
-        # 2. 사용자 요청에 따라 위로 5픽셀만 끌어올림 (-5)
-        v_corrected = max(0, v_mean - 5)
-        
-        # 3. 보정된 2D 픽셀을 다시 3D 공간(Base 좌표계)으로 역투영하여 완벽한 3D 센터 확보
-        d_center = float(arr[v_corrected, u_mean]) * 0.001
-        if d_center < 0.05: 
-            d_center = z_top_m  # 안전장치
-            
-        cam_center = rs.rs2_deproject_pixel_to_point(self.intr, [float(u_mean), float(v_corrected)], d_center)
-        cam_center_h = np.array([cam_center[0], cam_center[1], cam_center[2], 1.0])
-        base_center = (self.T_cam2base @ cam_center_h)[:3] * 1000.0
-        
-        cx, cy, cz = float(base_center[0]), float(base_center[1]), float(base_center[2])
+        # base 좌표로 변환된 윗면 점들의 외접 사각형(minAreaRect) 중심을 큐브 중심으로 사용.
+        # 무게중심(mean)은 카메라 yaw 에 따라 옆면 픽셀이 mask 에 일부 포함되면 그쪽으로
+        # 편향됨. minAreaRect 중심은 외접 사각형의 기하 중심이라 mask 형태 변형에 강함.
+        xy_mm10 = (base_pts[:, :2] * 10.0).astype(np.int32)   # cv2 정수 입력 (0.1mm 정밀도)
+        rect_center = cv2.minAreaRect(xy_mm10)[0]
+        cx = float(rect_center[0]) / 10.0
+        cy = float(rect_center[1]) / 10.0
+        cz = float(np.median(base_pts[:, 2]))                  # 윗면 점들의 z median (depth 노이즈 흡수)
 
-        color_crop = color[y1:y2, x1:x2]
-        gray = cv2.cvtColor(color_crop, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (3, 3), 0)
-        edges = cv2.Canny(gray, 30, 100)
-        
-        k7 = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
-        mask_dilated = cv2.dilate(mask_local, k7)
-        edges = cv2.bitwise_and(edges, edges, mask=mask_dilated)
-        
-        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=10, minLineLength=5, maxLineGap=5)
-        
-        yaw_deg = None
-        if lines is not None and len(lines) >= 1:
-            f = 4.0
-            sin_sum, cos_sum, n = 0.0, 0.0, 0
-            for x_1, y_1, x_2, y_2 in lines.reshape(-1, 4):
-                if x_1 == x_2 and y_1 == y_2: continue
-                a = math.atan2(y_2 - y_1, x_2 - x_1)
-                sin_sum += math.sin(a * f)
-                cos_sum += math.cos(a * f)
-                n += 1
-            if n > 0:
-                yaw_img = math.degrees(math.atan2(sin_sum, cos_sum)) / f
-                while yaw_img > 45.0: yaw_img -= 90.0
-                while yaw_img <= -45.0: yaw_img += 90.0
-                
-                cu = (x1 + x2) / 2.0
-                cv_ = (y1 + y2) / 2.0
-                half_px = 15.0
-                rad = math.radians(yaw_img)
-                cs, sn = math.cos(rad), math.sin(rad)
-                local = np.array([[-half_px, -half_px], [half_px, -half_px],
-                                  [half_px, half_px], [-half_px, half_px]], dtype=np.float32)
-                R = np.array([[cs, -sn], [sn, cs]], dtype=np.float32)
-                box_px = (local @ R.T) + np.array([cu, cv_], dtype=np.float32)
-                
-                bp_virtual = []
-                for pt in box_px:
-                    c = rs.rs2_deproject_pixel_to_point(self.intr, [float(pt[0]), float(pt[1])], z_top_m)
-                    ch = np.array([c[0], c[1], c[2], 1.0])
-                    b = (self.T_cam2base @ ch)[:3] * 1000.0
-                    bp_virtual.append([b[0], b[1]])
-                
-                bp_virtual = np.array(bp_virtual, dtype=np.float32)
-                rect_virtual = cv2.minAreaRect(bp_virtual)
-                yaw_deg = float(rect_virtual[2])
-                while yaw_deg > 45.0: yaw_deg -= 90.0
-                while yaw_deg <= -45.0: yaw_deg += 90.0
-                
-        if yaw_deg is None:
-            xy_int = (base_pts[:, :2] * 10.0).astype(np.int32)
-            rect = cv2.minAreaRect(xy_int)
-            yaw_deg = float(rect[2])
-            while yaw_deg > 45.0: yaw_deg -= 90.0
-            while yaw_deg <= -45.0: yaw_deg += 90.0
-            
-        return {'center_xyz_mm': (cx, cy, cz), 'cube_yaw_deg': yaw_deg, 'yaw_src': 'robust'}
+        # 시차 보정 — center 를 픽셀로 역투영 → v -CENTER_UP_PIXEL → 다시 base 재투영.
+        # mask 가 전체적으로 아래쪽으로 치우치는 현상 (카메라 살짝 비스듬) 일률 보정.
+        # 주의: rs2_deproject 는 *camera frame depth* (m) 필요 — base z 가 아니라 cam_m[2] 사용.
+        if CENTER_UP_PIXEL != 0:
+            T_base2cam = np.linalg.inv(self.T_cam2base)
+            p_base_m = np.array([cx / 1000.0, cy / 1000.0, cz / 1000.0, 1.0])
+            cam_m = T_base2cam @ p_base_m
+            u_c, v_c = rs.rs2_project_point_to_pixel(self.intr, cam_m[:3])
+            v_c_corrected = max(0.0, float(v_c) - float(CENTER_UP_PIXEL))
+            cam_corr = rs.rs2_deproject_pixel_to_point(
+                self.intr, [float(u_c), v_c_corrected], float(cam_m[2]))
+            cam_corr_h = np.array([cam_corr[0], cam_corr[1], cam_corr[2], 1.0])
+            base_corr = (self.T_cam2base @ cam_corr_h)[:3] * 1000.0
+            cx = float(base_corr[0])
+            cy = float(base_corr[1])
+
+        # yaw — base_pts (mask 정제 + largest CC 거친 윗면 점들) 의 외접 사각형 각도.
+        # 기존엔 RGB Canny+Hough 직선 검출로 yaw 추정했는데 옆면/그림자/조명 edge 가 섞여
+        # ±몇도 어긋남이 발생. depth mask 정제된 base 좌표 점들의 minAreaRect 각도가
+        # RGB 노이즈 영향 없이 더 안정적.
+        xy_int = (base_pts[:, :2] * 10.0).astype(np.int32)
+        rect_yaw = cv2.minAreaRect(xy_int)
+        yaw_deg = float(rect_yaw[2])
+        while yaw_deg > 45.0: yaw_deg -= 90.0
+        while yaw_deg <= -45.0: yaw_deg += 90.0
+
+        return {'center_xyz_mm': (cx, cy, cz), 'cube_yaw_deg': yaw_deg, 'yaw_src': 'rect'}
 
     def _yaw_from_depth_bbox(self, depth_frame, bbox):
 
@@ -830,16 +818,7 @@ class CubeDetector:
                     for i in range(len(xywh)):
                         cx, cy, w, h = xywh[i]
                         poly = polys[i] if i < len(polys) else None
-                        cls_id = int(cls_ids[i])
-                        
-                        # Side face 그리기
-                        if cls_id != 0:
-                            x1, y1 = int(cx - w / 2), int(cy - h / 2)
-                            x2, y2 = int(cx + w / 2), int(cy + h / 2)
-                            cv2.rectangle(vis, (x1, y1), (x2, y2), (255, 0, 0), 1)
-                            if poly is not None and len(poly) >= 3:
-                                cv2.polylines(vis, [poly.astype(np.int32)], True, (255, 100, 100), 1)
-                            continue
+                        # seg_v6 (단일 클래스 'wood cube') — 클래스 필터링 불필요.
 
                         # 품질 검증 — false positive reject
                         ok, reason = self._polygon_quality_ok(poly)
@@ -1255,6 +1234,33 @@ def select_next_target(detections, used_indices):
     return best
 
 
+def unify_z_with_outlier_reject(dets: list, tol_mm: float = 25.0) -> list:
+    """같은 판 위 cube 들의 검출 z 를 median 으로 통일.
+    median 에서 ±tol_mm 벗어난 cube 는 outlier 로 skip (잘못된 검출).
+    depth 노이즈/calibration 미세 오차를 흡수해 pick/place 일관성 확보.
+    dets 가 2개 미만이면 그대로 반환."""
+    if len(dets) < 2:
+        return dets
+    zs = [d['base_xyz_mm'][2] for d in dets]
+    zmed = float(np.median(zs))
+    good, bad = [], []
+    for d in dets:
+        if abs(d['base_xyz_mm'][2] - zmed) <= tol_mm:
+            good.append(d)
+        else:
+            bad.append(d)
+    if bad:
+        print(f'  !! z outlier cube {len(bad)}개 skip '
+              f'(median z={zmed:.1f}mm, 허용 ±{tol_mm}mm)')
+        for d in bad:
+            x, y, z = d['base_xyz_mm']
+            print(f'     skip: ({x:.1f}, {y:.1f}, {z:.1f}) mm (Δz={z-zmed:+.1f})')
+    print(f'  z 통일: median {zmed:.1f}mm 로 모든 cube z 통일 '
+          f'(같은 판 위 가정, depth 노이즈 흡수)')
+    return [{**d, 'base_xyz_mm': (d['base_xyz_mm'][0], d['base_xyz_mm'][1], zmed)}
+            for d in good]
+
+
 # ===== Pick & Place 사이클 =====
 # RH-P12-RN-A 는 spring-loaded 가 아니라서 토크 OFF 만으로 release 안 됨.
 # 반드시 명시적 open 명령(pos < 700) 으로 풀어야 함.
@@ -1264,37 +1270,6 @@ def gripper_set_width(robot, width_mm: float, settle=GRIPPER_SETTLE_SEC):
     """그리퍼 폭(mm) 명령. 12번 gripper_set 과 동일 구조."""
     pos = width_mm_to_pos(width_mm)
     return robot.gripper_set(pos, settle=settle, label=f'W{width_mm:.0f}mm')
-
-
-def gradual_gripper_release(robot, end_width_mm=None, n_steps=3, step_settle=0.08,
-                             start_width_mm=None):
-    """그리퍼를 N 단계로 점진적 open — close 상태에서 release_width 까지.
-    "팍" 놓지 않고 cube 가 cell 표면에 부드럽게 안착하도록.
-    start_width_mm: close 시점 그리퍼 width (cube_w_mm 측정값). None 이면 CUBE_WIDTH_MM."""
-    if end_width_mm is None:
-        end_width_mm = RELEASE_WIDTH_MM
-    if start_width_mm is None:
-        start_width_mm = CUBE_WIDTH_MM
-    start_width = start_width_mm   # close 후 finger 가 cube 옆에 닿은 상태
-    for i in range(1, n_steps + 1):
-        width = start_width + (end_width_mm - start_width) * i / n_steps
-        is_last = (i == n_steps)
-        settle = GRIPPER_SETTLE_SEC if is_last else step_settle
-        gripper_set_width(robot, width, settle=settle)
-
-
-
-
-def fast_gripper_close(robot, cube_w_mm=None):
-    """cube_w_mm 측정값이 있으면 그 width 기반 close (finger 가 cube 옆 살짝 dig).
-    없거나 비정상이면 GRIP_CLOSE_POS=700 완전 닫힘 (cube 짓누름)."""
-    if cube_w_mm is not None and 20.0 <= cube_w_mm <= 40.0:
-        target_pos = width_mm_to_pos(cube_w_mm - GRIP_CLOSE_OVERSHOOT_MM)
-        label = f'CLOSE_w{cube_w_mm:.1f}mm'
-    else:
-        target_pos = p12.GRIP_CLOSE_POS
-        label = 'CLOSE_default'
-    return robot.gripper_set(target_pos, settle=GRIPPER_SETTLE_SEC, label=label)
 
 
 def _descend_cartesian_with_yaw_retry(robot, target_xyz, intermediate_xyz, base_rpy):
@@ -1310,8 +1285,9 @@ def _descend_cartesian_with_yaw_retry(robot, target_xyz, intermediate_xyz, base_
 
     Returns: 최종 사용된 rpy_deg 리스트 (이후 close/lift 도 같은 yaw 써야 함).
     """
+    # descend 직선은 DESCEND_DURATION_SEC 으로 느림 (잡기/놓기 정밀). intermediate 는 빠름.
     try:
-        robot.move_line_base(target_xyz, rpy_deg=base_rpy)
+        robot.move_line_base(target_xyz, rpy_deg=base_rpy, duration=DESCEND_DURATION_SEC)
         return list(base_rpy)
     except RuntimeError as e:
         if 'Ikin' not in str(e):
@@ -1323,7 +1299,8 @@ def _descend_cartesian_with_yaw_retry(robot, target_xyz, intermediate_xyz, base_
     # 단계에서 검증된 자세라 거의 항상 풀림. 이후 alt yaw 회전이 짧아짐.
     try:
         robot.move_line_base(intermediate_xyz,
-                             rpy_deg=[base_rpy[0], base_rpy[1], 0.0])
+                             rpy_deg=[base_rpy[0], base_rpy[1], 0.0],
+                             duration=MOVE_DURATION_SEC)
         print(f'    [retry] wrist yaw=0° align 완료 → alt yaw 시도')
     except RuntimeError as e_align:
         if 'Ikin' not in str(e_align):
@@ -1336,8 +1313,8 @@ def _descend_cartesian_with_yaw_retry(robot, target_xyz, intermediate_xyz, base_
         print(f'    [retry] descend yaw {base_yaw:+.1f}° IK 실패 → 등가 yaw '
               f'{alt_yaw:+.1f}° 재시도 (cube 4-fold / jaw 180° 대칭 활용)')
         try:
-            robot.move_line_base(intermediate_xyz, rpy_deg=alt_rpy)
-            robot.move_line_base(target_xyz, rpy_deg=alt_rpy)
+            robot.move_line_base(intermediate_xyz, rpy_deg=alt_rpy, duration=MOVE_DURATION_SEC)
+            robot.move_line_base(target_xyz, rpy_deg=alt_rpy, duration=DESCEND_DURATION_SEC)
             return alt_rpy
         except RuntimeError as e2:
             if 'Ikin' not in str(e2):
@@ -1376,22 +1353,22 @@ def execute_one_cycle(robot, target, cell_xy, args):
     # 모든 cube 는 grid 에 yaw=0° 로 release — 다음 단계(탑쌓기 등) 가 axis-aligned 가정.
     place_rpy = [0.0, 180.0, 0.0]
 
-    # cube 옆면 그립을 위해 cube 중심 z 로 내려감 (검출 z = cube 윗면 가정)
-    # 사용자 요청: "cube 높이 /2 만큼" — eff_h 측정값 사용 (이전 fixed CUBE_WIDTH_MM)
-    pick_z = bz - eff_h / 2.0
+    # pick/place 절대 z = FLOOR_Z + PICK_HEIGHT_ABOVE_FLOOR_MM.
+    # 모든 cube 가 동일 크기(25mm) 라서 윗면 z 도 일정 — 검출 bz 마다 따로 계산할 필요 없이
+    # 절대 좌표 PICK_Z 로 통일 (사용자 셋업, depth 노이즈/검출 오차도 흡수됨).
+    pick_z = PICK_Z
     approach = [bx, by, pick_z + Z_APPROACH]
     pick = [bx, by, pick_z]
     lift = [bx, by, pick_z + Z_LIFT]
 
-    # release 시 cube 바닥이 표면과 충돌하지 않게 z 를 RELEASE_LIFT_MM 만큼 올려서 떨어트림
-    place = [cell_xy[0], cell_xy[1], pick_z + RELEASE_LIFT_MM]
-    place_app = [cell_xy[0], cell_xy[1], pick_z + Z_APPROACH]
+    place = [cell_xy[0], cell_xy[1], pick_z]
+    # place 강하 시작 z = 바닥 + PLACE_APP_HEIGHT_ABOVE_FLOOR_MM (사용자 셋업, 일직선 강하).
+    place_app = [cell_xy[0], cell_xy[1], PLACE_APP_Z]
 
     dur = MOVE_DURATION_SEC
     is_diagonal = bool(target.get('is_diagonal_grip', False))
-    # 동적 pre_open = cube_w + clearance (이전 fixed PRE_OPEN_WIDTH_MM=40)
-    pre_open_width = (DIAG_PRE_OPEN_WIDTH_MM if is_diagonal
-                      else eff_w + PRE_OPEN_CLEARANCE_MM)
+    # 모든 open 동작 통일 폭 (45mm) — cube 25mm + 대각 35.4mm 둘 다 안 닿게 충분.
+    pre_open_width = GRIPPER_OPEN_WIDTH_MM
 
     # ---- Pick: approach + descend 한 trajectory 로 (multi-WP, 사이 정지 없음) ----
     # 이전엔 approach 따로 + cartesian descend 따로 (컨트롤러 mix 정지). 모두 joint
@@ -1405,7 +1382,9 @@ def execute_one_cycle(robot, target, cell_xy, args):
         robot.gripper_set(width_mm_to_pos(pre_open_width),
                           settle=0.0, label=f'PRE_OPEN_async_{pre_open_width:.0f}mm')
         try:
-            robot.move_line_base_multi_smooth([(approach, pick_rpy), (pick, pick_rpy)])
+            # approach 는 빠른 dur, descend (pick) 직전은 DESCEND_DURATION_SEC 으로 느림 → 정밀 잡기.
+            robot.move_line_base_multi([(approach, pick_rpy), (pick, pick_rpy)],
+                                        [MOVE_DURATION_SEC, DESCEND_DURATION_SEC])
         except RuntimeError as e:
             if 'Ikin' not in str(e):
                 raise
@@ -1414,41 +1393,55 @@ def execute_one_cycle(robot, target, cell_xy, args):
             pick_rpy = _descend_cartesian_with_yaw_retry(robot, pick, approach, pick_rpy)
         yaw_used = pick_rpy[2]
 
-    # 2) close (잡기) — cube_w_mm 동적 close
-    print(f'    2) close (잡기) — cube_w={eff_w:.1f}mm 기반')
-    if not args.dry_run: fast_gripper_close(robot, cube_w_mm=eff_w)
+    # 2) close (잡기) — 3단계 자가정렬:
+    #    (a) half-close (28mm) + 0.3s 대기 → finger 가 cube 옆면 살짝 잡음
+    #    (b) wiggle (yaw +N°) → 원위치: cube 가 finger 와 함께 회전해 옆면 평행 정렬
+    #        IK 실패 시 wiggle skip (안전, 그냥 완전 close)
+    #    (c) 완전 close + 1.0s settle → 강하게 잡고 lift 시작 보장
+    print(f'    2) close: half ({HALF_CLOSE_WIDTH_MM:.0f}mm) → wiggle ±{WIGGLE_YAW_DEG:.0f}° → 완전 닫음')
+    if not args.dry_run:
+        gripper_set_width(robot, HALF_CLOSE_WIDTH_MM, settle=HALF_CLOSE_SETTLE_SEC)
+        wiggle_rpy = [pick_rpy[0], pick_rpy[1], pick_rpy[2] + WIGGLE_YAW_DEG]
+        try:
+            robot.move_line_base(pick, rpy_deg=wiggle_rpy, duration=WIGGLE_DURATION_SEC)
+            robot.move_line_base(pick, rpy_deg=pick_rpy, duration=WIGGLE_DURATION_SEC)
+        except RuntimeError as e:
+            if 'Ikin' not in str(e):
+                raise
+            print(f'    [wiggle] IK 실패 → 회전 skip, 완전 close 로 진행')
+        robot.gripper_set(p12.GRIP_CLOSE_POS, settle=1.0, label='CLOSE')
 
-    # ---- Transit + place descend: 한 trajectory 로 (multi-WP, 사이 정지 없음) ----
-    # 이전엔 transit (lift→align→place_app) 후 cartesian descend 분리. 이젠 place 까지
-    # multi-WP 에 포함해서 한 번에. IK 실패 시 transit 만 가고 yaw retry 로 fallback.
+    # ---- Transit (place_app 위까지) + 별도 place descend (수직 강하 보장) ----
+    # transit + place 를 한 multi-WP 에 묶으면 segment blend 로 place_app → place 가
+    # 사선이 됨. transit (multi) 와 place descend (단발 cartesian) 분리해서 수직 강제.
     transit = [(lift, pick_rpy)]
     if abs(yaw_used) > 0.5:
         transit.append((lift, place_rpy))          # 같은 XYZ 에서 yaw=0 align
     transit.append((place_app, place_rpy))           # target cell 위
-    transit_with_place = transit + [(place, place_rpy)]
     align_note = ' + align yaw→0' if abs(yaw_used) > 0.5 else ''
-    print(f'    3) transit+place (lift{align_note} → cell → descend) — {len(transit_with_place)} WP')
-    for wp, rp in transit_with_place:
+    print(f'    3a) transit (lift{align_note} → cell 위) — {len(transit)} WP')
+    for wp, rp in transit:
         print(f'       · {[round(v, 1) for v in wp]} rpy={[round(v,1) for v in rp]}')
+    print(f'    3b) place descend (수직 강하) → {[round(v, 1) for v in place]}')
     if not args.dry_run:
+        # (a) Transit (multi)
+        robot.move_line_base_multi(transit, [MOVE_DURATION_SEC] * len(transit))
+        # (b) Place descend — 단발 cartesian, 수직 강하 보장 + 느린 정밀 속도
         try:
-            robot.move_line_base_multi_smooth(transit_with_place)
+            robot.move_line_base(place, rpy_deg=place_rpy, duration=DESCEND_DURATION_SEC)
         except RuntimeError as e:
             if 'Ikin' not in str(e):
                 raise
-            print(f'    [merge-fallback] transit+place IK fail → transit only + yaw retry')
-            robot.move_line_base_multi_smooth(transit)
+            print(f'    [place-fallback] place descend IK fail → yaw retry')
             place_rpy = _descend_cartesian_with_yaw_retry(robot, place, place_app, place_rpy)
 
     # ---- Place release + lift up ----
     # multi-WP descend 의 마지막 WP 라 종점 도착 보장됨 → 추가 sleep 불필요.
-    # release 도 단발 — cube 25mm ↔ release 27mm 차이 2mm 라 점진 의미 약함.
-    # 동적 release width = cube_w + clearance (cube 옆에 살짝 벌려 떨어짐)
-    release_w = eff_w + RELEASE_CLEARANCE_MM
-    print(f'    4) release → {release_w:.1f}mm (cube_w {eff_w:.1f} + clearance)')
+    # release 는 RELEASE_OPEN_WIDTH_MM (살짝만 벌림). open 후 0.5초 대기 — cube 안착.
+    print(f'    4) release → {RELEASE_OPEN_WIDTH_MM:.0f}mm + 0.5s 대기')
     if not args.dry_run:
-        gradual_gripper_release(robot, end_width_mm=release_w,
-                                start_width_mm=eff_w, n_steps=1)
+        gripper_set_width(robot, RELEASE_OPEN_WIDTH_MM)
+        time.sleep(0.5)
 
     print(f'    5) lift up → {[round(v, 1) for v in place_app]}')
     if not args.dry_run:
@@ -1518,55 +1511,28 @@ def main():
             x, y, z = d['base_xyz_mm']
             print(f'   #{i}: ({x:.1f}, {y:.1f}, {z:.1f}) mm  conf={d["conf"]:.2f}')
 
-        # 작업영역 밖 cube 필터
+        # 작업영역 밖 cube 필터 — 15번 자체 한계 (12번 -600~600 보다 큰 셋업용)
         def _in_workspace(d):
-            bx, by, bz = d['base_xyz_mm']
-            pz = bz - CUBE_WIDTH_MM / 2.0
+            bx, by, _bz = d['base_xyz_mm']
+            pz = PICK_Z
             az = pz + Z_APPROACH
-            return (p12.WORK_X[0] <= bx <= p12.WORK_X[1] and
-                    p12.WORK_Y[0] <= by <= p12.WORK_Y[1] and
-                    p12.WORK_Z[0] <= pz <= p12.WORK_Z[1] and
-                    p12.WORK_Z[0] <= az <= p12.WORK_Z[1])
+            return (WORK_X[0] <= bx <= WORK_X[1] and
+                    WORK_Y[0] <= by <= WORK_Y[1] and
+                    WORK_Z[0] <= pz <= WORK_Z[1] and
+                    WORK_Z[0] <= az <= WORK_Z[1])
 
         inside = [d for d in dets if _in_workspace(d)]
         skipped = len(dets) - len(inside)
         if skipped:
             print(f'  !! 작업영역 밖 cube {skipped}개 skip '
-                  f'(X∈{p12.WORK_X}, Y∈{p12.WORK_Y}, Z∈{p12.WORK_Z})')
+                  f'(X∈{WORK_X}, Y∈{WORK_Y}, Z∈{WORK_Z})')
             for d in dets:
                 if not _in_workspace(d):
                     x, y, z = d['base_xyz_mm']
                     print(f'     skip: ({x:.1f}, {y:.1f}, {z:.1f}) mm')
         dets = inside
 
-        # z 통일 — 같은 판 위 cube 들은 동일 높이 가정.
-        # depth 노이즈/calibration 미세 오차로 검출 z 가 ±수mm 흔들리는 것을 흡수.
-        # 1) outlier reject (median 에서 ±25mm 벗어나면 잘못된 검출)
-        # 2) 나머지 cube 의 z 를 median 으로 통일 → pick/place 일관성
-        Z_OUTLIER_TOL_MM = 25.0
-        if len(dets) >= 2:
-            zs = [d['base_xyz_mm'][2] for d in dets]
-            zmed = float(np.median(zs))
-            good, bad = [], []
-            for d in dets:
-                if abs(d['base_xyz_mm'][2] - zmed) <= Z_OUTLIER_TOL_MM:
-                    good.append(d)
-                else:
-                    bad.append(d)
-            if bad:
-                print(f'  !! z outlier cube {len(bad)}개 skip '
-                      f'(median z={zmed:.1f}mm, 허용 ±{Z_OUTLIER_TOL_MM}mm)')
-                for d in bad:
-                    x, y, z = d['base_xyz_mm']
-                    print(f'     skip: ({x:.1f}, {y:.1f}, {z:.1f}) mm (Δz={z-zmed:+.1f})')
-            # z 통일 (같은 판 가정)
-            print(f'  z 통일: median {zmed:.1f}mm 로 모든 cube z 통일 '
-                  f'(같은 판 위 가정, depth 노이즈 흡수)')
-            unified = []
-            for d in good:
-                x, y, _ = d['base_xyz_mm']
-                unified.append({**d, 'base_xyz_mm': (x, y, zmed)})
-            dets = unified
+        dets = unify_z_with_outlier_reject(dets)
 
         if not dets:
             print('!! 잡을 수 있는 cube 0개 — 종료')
@@ -1657,9 +1623,8 @@ def main():
                     robot._last_ik_sol = None
                     # (c) 현재 위치에서 LIFT 높이로 안전 회피 (다음 cube approach 충돌 방지)
                     try:
-                        bx_s, by_s, bz_s = target['base_xyz_mm']
-                        pick_z_s = bz_s - CUBE_WIDTH_MM / 2.0
-                        robot.move_line_base([bx_s, by_s, pick_z_s + Z_LIFT],
+                        bx_s, by_s, _bz_s = target['base_xyz_mm']
+                        robot.move_line_base([bx_s, by_s, PICK_Z + Z_LIFT],
                                               rpy_deg=[0.0, 180.0, 0.0],
                                               duration=MOVE_DURATION_SEC)
                     except Exception as e_safe:
