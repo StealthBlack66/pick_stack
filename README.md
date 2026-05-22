@@ -129,7 +129,7 @@ python3 15_바둑판_정렬.py
 ### 3. Hand-Eye 캘리브레이션 (최초 1회)
 
 ```bash
-./run_calibration.sh
+python3 09_원샷_캘리브레이션.py
 # → calibration_data/calibration_result.npz 생성
 ```
 
